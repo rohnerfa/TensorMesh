@@ -309,8 +309,9 @@ class BlockLayout:
         For a field of mesh order this is the identity; for an order-1
         field on a higher-order mesh the values are FE-interpolated to the
         midside/interior nodes (useful e.g. to plot a P1 pressure on a P2
-        mesh). For hierarchical fields evaluates modal coefficients with
-        orientation signs, even when field order equals geometry order.
+        mesh). For hierarchical fields evaluates modal coefficients using
+        triangle signs or oriented tetrahedral tables, even when field order
+        equals geometry order.
         """
         if self.field(name).basis == "hierarchical":
             from .field_evaluation import prolong_modal
@@ -360,11 +361,13 @@ class BlockLayout:
 
         Notes
         -----
-        Hierarchical interpolation solves a reference modal collocation
-        system at degree-p barycentric lattice points, without constructing
-        a monomial basis. Shared coefficients are oriented and averaged.
-        This is interpolation, not L2 projection. On curved geometry the
-        approximation is polynomial in reference coordinates.
+        Triangle modal interpolation solves reference collocation systems
+        and averages oriented shared coefficients. Tetrahedra fit each shared
+        vertex, edge and face once, followed by private cell residuals. Edges
+        use Lobatto samples; faces and cells use interior barycentric lattices.
+        Neither construction uses a monomial basis. This is interpolation,
+        not L2 projection. On curved geometry the approximation is polynomial
+        in reference coordinates.
         """
         from .field_evaluation import interpolate
         return interpolate(self, name, fn)
@@ -404,10 +407,12 @@ class BlockLayout:
 
         Notes
         -----
-        Physical evaluation inverts triangle geometry with batched Newton
-        iteration, seeded by corner-affine coordinates. Outside points and
-        nonconvergence raise ValueError. This is not a global point locator;
-        curved maps must be valid and invertible.
+        Physical evaluation inverts triangle/tetrahedron geometry using an
+        affine inverse or batched Newton iteration seeded by corner-affine
+        coordinates. Outside points and nonconvergence raise ValueError.
+        This is not a global point locator; curved maps must be valid and
+        invertible. Tetrahedral evaluation uses the selected cells' oriented
+        reference tables and preserves their requested order.
         """
         from .field_evaluation import evaluate
         return evaluate(self, name, coefficients, points, element_type, cell_indices,
@@ -436,8 +441,10 @@ class BlockLayout:
         Notes
         -----
         Combine with boundary_mask and Condenser. Modal traces are expanded
-        in vertex/edge functions using Lobatto-type samples; nonpolynomial
-        traces are interpolated rather than represented exactly.
+        in vertex/edge functions using Lobatto-type samples, then tetrahedral
+        face residuals using interior barycentric samples. Only entities in
+        the boundary closure are fitted. Nonpolynomial traces are interpolated
+        rather than represented exactly.
         """
         from .field_evaluation import dirichlet_values
         return dirichlet_values(self, name, fn, component)

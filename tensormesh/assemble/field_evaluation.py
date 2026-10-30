@@ -1,15 +1,16 @@
 """Field interpolation, modal traces and cell-wise evaluation for BlockLayout.
 
 These are postprocessing/setup operations, not part of the assembly hot path.
-All cell operations are batched; Python loops run over element types, edges,
-or Newton iterations only. No monomial expansion is constructed.
+All cell operations are batched; Python loops run over element types,
+orientation classes, local entities or Newton iterations. No monomial
+expansion is constructed.
 """
 
 import math
 
 import torch
 
-from ..element import Triangle, element_type2element
+from ..element import Tetrahedron, Triangle, element_type2element
 from .topology import boundary_facet_mask
 
 
@@ -69,6 +70,9 @@ def _modal_interpolate(layout, name, sample):
     averaged after orientation to remove floating-point discrepancies.
     """
     asm, field = layout._asm, layout.field(name)
+    if all(element_type2element(kind) is Tetrahedron for kind in asm.element_types):
+        from .tetrahedron_fields import interpolate_entities
+        return interpolate_entities(layout, name, sample)
     pts = asm._points
     ref = Triangle.get_basis(field.order, pts.dtype, pts.device)
     out = None
@@ -120,8 +124,9 @@ def restrict_modal(layout, name, point_data):
 
 
 def _reference_coordinates(layout, kind, cells, physical, max_iterations, tolerance):
-    if element_type2element(kind) is not Triangle:
-        raise NotImplementedError("physical evaluation currently supports triangles only")
+    elem = element_type2element(kind)
+    if elem not in (Triangle, Tetrahedron):
+        raise NotImplementedError("physical evaluation supports triangles and tetrahedra only")
     if (isinstance(max_iterations, bool) or not isinstance(max_iterations, int)
             or max_iterations < 1):
         raise ValueError("max_iterations must be a positive integer")
@@ -135,7 +140,7 @@ def _reference_coordinates(layout, kind, cells, physical, max_iterations, tolera
             raise ValueError("physical-to-reference mapping failed: singular geometry Jacobian") from exc
 
     asm = layout._asm
-    coords = asm._points[asm.elements[kind][cells, :3]]
+    coords = asm._points[asm.elements[kind][cells, :elem.n_vertex]]
     jac = (coords[:, 1:] - coords[:, :1]).transpose(-1, -2)
     reference = solve(jac[:, None], (physical - coords[:, :1])[..., None]).squeeze(-1)
     if physical.numel() == 0:
@@ -143,7 +148,7 @@ def _reference_coordinates(layout, kind, cells, physical, max_iterations, tolera
     eps = torch.finfo(physical.dtype).eps
     scale = max(1.0, float(coords.detach().abs().max()))
     tol = 128 * eps * scale if tolerance is None else tolerance
-    for _ in range(max_iterations):
+    for _ in range(max_iterations if asm.mesh_order > 1 else 0):
         mapped, jac = _geometry(layout, kind, cells, reference, gradients=True)
         residual = mapped - physical
         if float(residual.detach().abs().max()) <= tol:
@@ -154,7 +159,7 @@ def _reference_coordinates(layout, kind, cells, physical, max_iterations, tolera
         raise ValueError("physical-to-reference mapping did not converge")
     domain_tol = max(1024 * eps, tol / scale)
     if (reference < -domain_tol).any() or (reference.sum(-1) > 1 + domain_tol).any():
-        raise ValueError("physical point lies outside its selected triangle")
+        raise ValueError(f"physical point lies outside its selected {elem.__name__.lower()}")
     return reference
 
 
@@ -195,6 +200,11 @@ def evaluate(layout, name, coefficients, points, element_type=None, cell_indices
     if physical:
         reference = _reference_coordinates(layout, element_type, cells, reference,
                                            max_iterations, tolerance)
+    if (layout.field(name).basis == "hierarchical"
+            and element_type2element(element_type) is Tetrahedron):
+        from .tetrahedron_fields import evaluate_oriented
+        return evaluate_oriented(layout, name, coefficients, element_type, cells,
+                                 reference, gradient)
     basis = _basis(layout, name, element_type)
     local = coefficients[conn[cells]]
     key = f"{name}__{element_type}"
@@ -240,6 +250,12 @@ def dirichlet_values(layout, name, fn, component=None):
         off = asm._offsets[name]
         mask = mask[off:off + layout.n_nodes(name) * field.components].reshape(-1, field.components)[:, 0]
         coefficients[mask] = _sample(fn, layout.points(name)[mask], c)
+    elif all(element_type2element(kind) is Tetrahedron for kind in asm.element_types):
+        from .tetrahedron_fields import interpolate_entities
+        coefficients = interpolate_entities(
+            layout, name,
+            lambda kind, cells, ref: _sample(fn, _geometry(layout, kind, cells, ref), c),
+            boundary_only=True, components=c)
     else:
         counts = torch.zeros(layout.n_nodes(name), dtype=points.dtype, device=points.device)
         boundary = boundary_facet_mask(asm.elements)

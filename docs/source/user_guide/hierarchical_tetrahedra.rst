@@ -7,6 +7,8 @@ and topological coefficient map are independent of geometry order. Select
 ``Field(..., basis="hierarchical")`` in :class:`~tensormesh.MixedElementAssembler`
 to assemble these spaces. This chapter describes their mathematical and API
 contract; see :doc:`mixed_assembly` for grouped integration and chunking.
+For interpolation, evaluation and nonzero boundary lifting, see
+:doc:`hierarchical_tetrahedron_fields`.
 
 Reference element and local layout
 ----------------------------------

@@ -1,7 +1,7 @@
 Poisson Equation
 ================
 
-Three scripts in ``examples/poisson/`` walk the Poisson problem
+The basic scripts in ``examples/poisson/`` walk the Poisson problem
 through TensorMesh's main features: a basic 2D solve, the same
 solver in 3D, and h-adaptive refinement on an L-shaped domain
 whose re-entrant corner produces a gradient singularity.
@@ -27,7 +27,7 @@ with corresponding weak form
    \int_\Omega f\, v \,\mathrm{d}\Omega
    \quad \forall v \in H^1_0(\Omega).
 
-Every example below realizes this with :class:`~tensormesh.LaplaceElementAssembler`
+The basic examples realize this with :class:`~tensormesh.LaplaceElementAssembler`
 for the stiffness, a :class:`~tensormesh.NodeAssembler` for the load,
 and :class:`~tensormesh.Condenser` for the homogeneous Dirichlet BC.
 The ground-truth source field comes from
@@ -147,6 +147,23 @@ PNG for quick inspection.
    mass-weighted relative :math:`L^2` error against the analytical
    Fourier solution is :math:`\mathrm{rel\_L2} = 1.059\times10^{-2}`
    at ``chara_length=0.05``.
+
+
+High-order tetrahedra — ``hierarchical_tetrahedron.py``
+-----------------------------------------------------------------
+
+This manufactured polynomial solve uses hierarchical H¹ fields on four connected
+tetrahedra with nonzero Dirichlet data. ``MixedElementAssembler`` integrates the
+stiffness and load in the modal space; entity-first trace interpolation supplies
+the boundary lifting. Values and physical gradients are checked at interior
+points and reported as JSON.
+
+.. code-block:: bash
+
+   python examples/poisson/hierarchical_tetrahedron.py --degree 4
+
+See :doc:`../user_guide/hierarchical_tetrahedron_fields` for interpolation,
+boundary lifting, arbitrary-point evaluation and curved geometry.
 
 
 h-adaptive refinement on the L-shape — ``poisson_h_adaptivity.py``
