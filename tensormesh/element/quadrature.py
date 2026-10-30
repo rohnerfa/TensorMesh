@@ -4,11 +4,53 @@ pyramid, prism, and their facets.
 Internal helpers wired into :meth:`~tensormesh.Element.get_quadrature` and
 :meth:`~tensormesh.Element.get_facet_quadrature`. Not part of the public API.
 """
+from functools import lru_cache
+
 import torch
 from typing import Tuple
 from scipy.special import roots_jacobi
 from .polynomial import Polynomials
 from .types import Tensorx2, Tensorx4, Tensorx5
+
+
+def _positive_order(order, rule):
+    if isinstance(order, bool) or not isinstance(order, int) or order < 1:
+        raise ValueError(f"{rule} quadrature order must be an integer >= 1")
+
+
+@lru_cache(maxsize=128)
+def _gaussian_interval_rule(n, alpha=0, beta=0):
+    """CPU float64 Gaussian rule for (1-x)**alpha x**beta on [0,1].
+
+    Private cached tensors must not be modified by callers. The Jacobi
+    weights on [-1,1] scale by 2**(-alpha-beta-1) under x=(1+s)/2.
+    alpha=beta=0 is Gauss-Legendre. SciPy generation is setup-only.
+    """
+    points, weights = roots_jacobi(n, alpha, beta)
+    return (torch.tensor(weights / 2 ** (alpha + beta + 1), dtype=torch.float64, device="cpu"),
+            torch.tensor((points + 1) / 2, dtype=torch.float64, device="cpu"))
+
+
+@lru_cache(maxsize=128)
+def _gaussian_triangle_rule(n):
+    """Conical Gaussian product rule, exact through total degree 2*n-1.
+
+    x=u, y=(1-u)*v has Jacobian 1-u, incorporated in the u Jacobi weights.
+    For x**a y**b, the remaining polynomial has degree a+b in u and b in v.
+    Thus n points in each direction suffice, without an extra Jacobian
+    degree. Weights are positive and points strictly inside the triangle.
+    """
+    wu, u = _gaussian_interval_rule(n, 1, 0)
+    wv, v = _gaussian_interval_rule(n)
+    uu, vv = torch.meshgrid(u, v, indexing="ij")
+    points = torch.stack((uu, (1 - uu) * vv), dim=-1).reshape(-1, 2)
+    weights = (wu[:, None] * wv[None, :]).reshape(-1)
+    return weights, points
+
+
+def _copy_rule(rule, dtype, device):
+    # .to() alone aliases the canonical cache for CPU float64 requests.
+    return tuple(t.to(dtype=dtype, device=device, copy=True) for t in rule)
 
 
 def lin_quadrature(order: int = 1,
@@ -20,7 +62,9 @@ def lin_quadrature(order: int = 1,
     Parameters
     ----------
     order : int, optional
-        Quadrature order between 1 and 7. Defaults to 1.
+        Number of Gaussian points (>= 1), exact through degree
+        ``2 * order - 1``. Defaults to 1. Unlike triangles, this parameter
+        counts points, not polynomial exactness degree (legacy convention).
     dtype : torch.dtype, optional
         Output dtype.
     device : torch.device, optional
@@ -33,7 +77,10 @@ def lin_quadrature(order: int = 1,
     points : torch.Tensor
         2D tensor of shape ``[n_quadrature, 1]``.
     """
-    assert order >= 1 and order <= 7, f"Invalid order {order} for lin quadrature, expected one of [1,7]"
+    _positive_order(order, "line")
+    if order > 7:
+        weights, points = _copy_rule(_gaussian_interval_rule(order), dtype, device)
+        return weights, points[:, None]
     weights_table = {
         1 : torch.tensor([2.0], dtype=dtype),
         2 : torch.tensor([1.0, 1.0], dtype=dtype),
@@ -75,7 +122,11 @@ def tri_quadrature(order: int = 1,
     Parameters
     ----------
     order : int, optional
-        Quadrature order between 1 and 7. Defaults to 1.
+        Requested polynomial exactness degree (>= 1). Defaults to 1.
+        Degrees 1..7 retain the original tabulated rules. Higher degrees
+        use a Gauss-Jacobi/Legendre conical product with
+        ``ceil((order + 1) / 2)**2`` points. These generated rules have
+        positive weights but are not symmetric or minimal-point rules.
     dtype : torch.dtype, optional
         Output dtype.
     device : torch.device, optional
@@ -88,7 +139,9 @@ def tri_quadrature(order: int = 1,
     points : torch.Tensor
         2D tensor of shape ``[n_quadrature, 2]``.
     """
-    assert order >= 1 and order <= 7, f"Invalid order {order} for tri quadrature, expected one of [1,7]"
+    _positive_order(order, "triangle")
+    if order > 7:
+        return _copy_rule(_gaussian_triangle_rule((order + 2) // 2), dtype, device)
     weights_table = {
         1: torch.tensor([0.5],dtype=dtype),
         2: torch.tensor([ 0.16666666666666666, 0.16666666666666666, 0.16666666666666666],dtype=dtype),
@@ -178,7 +231,8 @@ def quad_quadrature(order: int = 1,
     Parameters
     ----------
     order : int, optional
-        Quadrature order between 1 and 7. Defaults to 1.
+        Number of Gaussian points per direction (>= 1). Exact through
+        degree ``2 * order - 1`` in each coordinate. Defaults to 1.
     dtype : torch.dtype, optional
         Output dtype.
     device : torch.device, optional
@@ -214,7 +268,8 @@ def hex_quadrature(order: int = 1,
     Parameters
     ----------
     order : int, optional
-        Quadrature order between 1 and 7. Defaults to 1.
+        Number of Gaussian points per direction (>= 1). Exact through
+        degree ``2 * order - 1`` in each coordinate. Defaults to 1.
     dtype : torch.dtype, optional
         Output dtype.
     device : torch.device, optional
@@ -258,7 +313,7 @@ def pyr_quadrature(order: int = 1,
     Parameters
     ----------
     order : int, optional
-        Number of points per direction, between 1 and 7. Defaults to 1.
+        Number of points per direction (>= 1). Defaults to 1.
     dtype : torch.dtype, optional
         Output dtype.
     device : torch.device, optional
@@ -300,7 +355,8 @@ def pri_quadrature(order: int = 1,
     Parameters
     ----------
     order : int, optional
-        Quadrature order between 1 and 7. Defaults to 1.
+        Triangle exactness degree and number of line points (>= 1),
+        preserving the existing mixed convention. Defaults to 1.
     dtype : torch.dtype, optional
         Output dtype.
     device : torch.device, optional
@@ -547,4 +603,3 @@ def mix_facet_quadrature_3d(facet_mapping: Polynomials,
           
     else:
         return (*tri_quadrature(order,dtype,device), *quad_quadrature(order,dtype, device))
-      

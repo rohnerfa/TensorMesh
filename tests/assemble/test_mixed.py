@@ -246,16 +246,17 @@ def test_validation_errors(p2_mesh, p1_mesh):
     with pytest.raises(ValueError):  # grad prefix
         Field(trial="gradient", test="v")
 
-    class BadQuadrature(MixedElementAssembler):
-        # order 4 is supported per se (generalized pairs), but its default
-        # quadrature degree 2*4=8 exceeds the tabulated maximum of 7
+    class HighOrderQuadrature(MixedElementAssembler):
+        # P4's default degree 8 now uses a generated triangle rule.
         fields = [Field(trial="u", test="v", order=4)]
 
         def forward(self, u, v):
             return u * v
 
+    high_order = HighOrderQuadrature.from_mesh(p2_mesh)
+    assert next(iter(high_order.transformation.values())).n_quadrature == 25
     with pytest.raises(ValueError, match="quadrature"):
-        BadQuadrature.from_mesh(p2_mesh)
+        HighOrderQuadrature.from_mesh(p2_mesh, quadrature_order=0)
 
     class DupNames(MixedElementAssembler):
         fields = [Field(trial="u", test="v"), Field(trial="p", test="u")]

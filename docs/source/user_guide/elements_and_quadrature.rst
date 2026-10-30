@@ -296,10 +296,28 @@ Step 4 — Reference quadrature (``get_quadrature``)
 
 :meth:`~tensormesh.Element.get_quadrature` returns a Gauss-type rule on
 the reference element — weights of shape ``[N_q]`` and points of shape
-``[N_q, D]``. The ``order`` argument is the *quadrature order*, not the
-basis order; pick it large enough to integrate your weak form exactly.
-As a rule of thumb, ``quadrature_order = 2 * basis_order`` is enough
-for most bilinear forms on Laplace-type problems.
+``[N_q, D]``. The ``order`` argument is independent of basis order, and
+its historical meaning depends on the shape:
+
+* **Triangles:** requested total polynomial exactness degree. Degrees 1–7
+  retain the original tables; higher degrees use a generated
+  Gauss–Jacobi/Legendre conical product with
+  :math:`\lceil(d+1)/2\rceil^2` points. Generated rules have positive weights
+  and interior points, but are not symmetric or minimal-point rules.
+* **Lines, quads and hexes:** number of Gaussian points per direction,
+  exact through degree ``2 * order - 1`` in each coordinate. There is no
+  longer a seven-point limit.
+* **Tetrahedra:** exactness degree, still limited to tables 1–7.
+* **Pyramids:** points per collapsed direction. **Prisms:** triangle
+  exactness degree and number of line points, preserving the mixed convention.
+
+For affine triangles with constant coefficients, stiffness needs degree
+``2*p - 2`` and mass needs ``2*p``. The mixed assembler defaults to
+``quadrature_order = 2 * max(field.order)`` and accepts an explicit override.
+Curved geometry, nonpolynomial coefficients and nonlinear forms generally
+require quadrature-convergence checks rather than a polynomial-exactness
+claim. Reference rules are generated in CPU float64 and converted to the
+requested dtype/device; arbitrary degree is subject to precision and cost.
 
 .. code-block:: python
 
@@ -310,7 +328,12 @@ for most bilinear forms on Laplace-type problems.
          #         [0.1667, 0.6667]])
 
 Triangle, quad, hex, tet, pyramid, prism each pick a different rule
-family; see ``tensormesh/element/quadrature.py`` for the tables.
+family; see ``tensormesh/element/quadrature.py`` for the tables and generators.
+
+.. code-block:: python
+
+   w, q = Triangle.get_quadrature(order=20, dtype=torch.float64)
+   assert w.shape == (121,)  # 11 x 11 conical Gaussian rule
 
 
 Step 5 — Reference shape values (``eval_shape_val``)

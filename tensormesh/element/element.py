@@ -1790,6 +1790,18 @@ class Triangle(Element):
 
     @classmethod
     @lru_cache()
+    def get_hierarchical_basis_fns(cls, order=1, dtype=torch.float32,
+                                   device=torch.device('cpu')):
+        """Return non-nodal H1 functions; does not alter the Lagrange default.
+
+        See :class:`~tensormesh.element.HierarchicalTriangleBasisFns` for
+        ordering, edge parity, and the compatible map/grad interface.
+        """
+        from .hierarchical_triangle import HierarchicalTriangleBasisFns
+        return HierarchicalTriangleBasisFns(order, dtype, device)
+
+    @classmethod
+    @lru_cache()
     def get_basis(cls, 
                   order:int=1, 
                   dtype:torch.dtype=torch.float32,
@@ -2586,7 +2598,6 @@ class Prism(Element):
         # For the linear wedge, TensorMesh reference vertex order matches VTK/Wedge6:
         # bottom triangle (0,1,2) then top triangle (3,4,5).
         return torch.arange(6, device=device, dtype=torch.long)
-
 
 
 
