@@ -54,6 +54,10 @@ declarations, one per unknown. Each field names its **trial** and
 **test** function (the argument names your ``forward`` will use), its
 polynomial ``order``, and its number of vector ``components``:
 
+Triangle fields may also select ``basis="hierarchical"`` instead of the
+default nodal Lagrange basis. See :doc:`hierarchical_triangles` for signed
+connectivity, modal initialization, evaluation and boundary conditions.
+
 .. code-block:: python
 
    fields = [

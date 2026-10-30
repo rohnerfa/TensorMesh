@@ -1,7 +1,7 @@
-r"""Mixed (multi-field / block) assembly over several Lagrange spaces.
+r"""Mixed (multi-field / block) assembly over Lagrange or hierarchical spaces.
 
 :class:`MixedElementAssembler` assembles a bilinear form that couples
-several Lagrange fields living on the *same* mesh — e.g. Taylor–Hood
+several polynomial fields living on the *same* mesh — e.g. Taylor–Hood
 P2–P1 for Stokes — into one block :class:`~tensormesh.sparse.SparseMatrix`,
 without any manual block/offset bookkeeping. Each field is declared with
 a :class:`Field` (trial/test argument names, polynomial order, number of
@@ -69,6 +69,15 @@ low-order geometry on a *curved* domain limits the attainable
 convergence rate of higher-order fields near the boundary). 3D spaces
 whose nodes sit on faces (e.g. P3 tetrahedra) await the face-orientation
 layer and raise ``NotImplementedError``.
+
+Triangle fields may opt into ``Field(..., basis="hierarchical")``. They
+always use signed topological DOF maps, including at mesh order. Reference
+tables stay shared across elements: signs act on integrated local test/trial
+contributions before projection, and on gathered ``field_data`` coefficients
+before interpolation. Geometry and ``point_data`` remain nodal Lagrange.
+BlockLayout supplies modal interpolation, trace liftings, evaluation and
+nodal output; modal point coordinates are deliberately not defined. The
+triangle quadrature supports arbitrary requested polynomial exactness degrees.
 """
 import inspect
 import math
@@ -78,7 +87,8 @@ import torch
 import torch.nn as nn
 
 from .projector import ReduceProjector
-from .topology import build_edges, lagrange_boundary_mask, lagrange_dofmap
+from .topology import (build_edges, lagrange_boundary_mask, lagrange_dofmap,
+                       hierarchical_dofmap, hierarchical_boundary_mask)
 from ..nn import BufferDict
 from ..element import (
     Transformation,
@@ -95,7 +105,7 @@ __all__ = ["Field", "BlockLayout", "MixedElementAssembler"]
 
 
 class Field:
-    r"""Declaration of one Lagrange field of a mixed bilinear form.
+    r"""Declaration of one polynomial field of a mixed bilinear form.
 
     Parameters
     ----------
@@ -108,14 +118,19 @@ class Field:
         is available as ``"grad" + test``. Test arguments index matrix
         **rows**.
     order : int, optional
-        Polynomial order of the field's Lagrange space — independent of
+        Polynomial order of the field's space — independent of
         the mesh order. Orders ``1`` and the mesh order carry their DOFs
-        on mesh nodes; any other order uses a topological DOF map (see
-        the module docstring for the 3D face-DOF limitation). Default ``1``.
+        on mesh nodes for Lagrange; any other order uses a topological DOF
+        map (see the module docstring for the 3D face-DOF limitation).
+        Default ``1``.
     components : int, optional
         Number of vector components :math:`c`. With ``c == 1`` the field
         is scalar (value ``[]``, gradient ``[D]``); with ``c > 1`` the
         value is ``[c]`` and the gradient ``[c, D]``. Default ``1``.
+    basis : str, optional
+        ``"lagrange"`` (default) or ``"hierarchical"`` (triangles only).
+        Hierarchical fields always use topological coefficient numbering,
+        even at the geometry order. Their coefficients are not point values.
 
     Examples
     --------
@@ -125,7 +140,8 @@ class Field:
         Field(trial="p", test="q", order=1)                 # P1 pressure
     """
 
-    def __init__(self, trial: str, test: str, order: int = 1, components: int = 1):
+    def __init__(self, trial: str, test: str, order: int = 1, components: int = 1,
+                 basis: str = "lagrange"):
         for role, name in (("trial", trial), ("test", test)):
             if not (isinstance(name, str) and name.isidentifier()):
                 raise ValueError(f"Field {role} name {name!r} is not a valid identifier")
@@ -142,14 +158,17 @@ class Field:
             raise ValueError(f"Field order must be a positive integer, got {order!r}")
         if not (isinstance(components, int) and components >= 1):
             raise ValueError(f"Field components must be a positive integer, got {components!r}")
+        if basis not in ("lagrange", "hierarchical"):
+            raise ValueError("Field basis must be 'lagrange' or 'hierarchical'")
         self.trial = trial
         self.test = test
         self.order = order
         self.components = components
+        self.basis = basis
 
     def __repr__(self):
         return (f"Field(trial={self.trial!r}, test={self.test!r}, "
-                f"order={self.order}, components={self.components})")
+                f"order={self.order}, components={self.components}, basis={self.basis!r})")
 
 
 class BlockLayout:
@@ -193,7 +212,7 @@ class BlockLayout:
         return self._asm._field(name)
 
     def n_nodes(self, name: str) -> int:
-        """Number of nodes (scalar DOF carriers) of field ``name``."""
+        """Number of scalar DOF carriers (nodes or modal coefficients)."""
         self.field(name)
         return self._asm.field_n_nodes[name]
 
@@ -208,8 +227,8 @@ class BlockLayout:
         if self._asm.field_kind[name] != "nodes":
             raise ValueError(
                 f"field {name!r} (order {self.field(name).order}) has topological "
-                f"DOF carriers, not mesh nodes — use points()/boundary_mask()/"
-                f"dof_mask(where=...) instead"
+                f"DOF carriers, not mesh nodes — use boundary_mask(), "
+                f"interpolate() or evaluate() instead"
             )
         return self._asm.field_node_ids[name]
 
@@ -220,6 +239,7 @@ class BlockLayout:
         field's reference nodes under the isoparametric (mesh-order)
         geometry map, so they are exact on curved elements too.
         """
+        self._require_nodal(name, "points")
         if self._asm.field_kind[name] == "nodes":
             return self._asm._points[self._asm.field_node_ids[name]]
         pts = self._asm._points
@@ -248,8 +268,14 @@ class BlockLayout:
         """Interpolate mesh-point data ``[n_points, ...]`` onto the field's nodes ``[n_f, ...]``.
 
         A plain gather for node-carried fields; FE interpolation with the
-        mesh-order basis for generalized-order fields.
+        mesh-order basis for generalized-order fields. For hierarchical
+        fields returns modal coefficients of the interpolated mesh FE data,
+        not samples. This operation cannot recover information absent from
+        the mesh-order input; use interpolate(fn) for analytic functions.
         """
+        if self.field(name).basis == "hierarchical":
+            from .field_evaluation import restrict_modal
+            return restrict_modal(self, name, point_data)
         n_points = self._asm.n_points
         assert point_data.shape[0] == n_points, (
             f"point_data must have shape [{n_points}, ...], got {list(point_data.shape)}"
@@ -272,8 +298,12 @@ class BlockLayout:
         For a field of mesh order this is the identity; for an order-1
         field on a higher-order mesh the values are FE-interpolated to the
         midside/interior nodes (useful e.g. to plot a P1 pressure on a P2
-        mesh).
+        mesh). For hierarchical fields evaluates modal coefficients with
+        orientation signs, even when field order equals geometry order.
         """
+        if self.field(name).basis == "hierarchical":
+            from .field_evaluation import prolong_modal
+            return prolong_modal(self, name, values)
         field = self.field(name)
         n_f = self.n_nodes(name)
         assert values.shape[0] == n_f, (
@@ -285,13 +315,121 @@ class BlockLayout:
                           dtype=values.dtype, device=values.device)
         for element_type in self._asm.element_types:
             elem_cls = element_type2element(element_type)
-            basis_pts = elem_cls.get_basis(self._asm.mesh_order) \
-                                .type(values.dtype).to(values.device)      # [nb_mesh, D]
+            basis_pts = elem_cls.get_basis(self._asm.mesh_order, values.dtype,
+                                           values.device)                 # [nb_mesh, D]
             interp = elem_cls.eval_shape_val(basis_pts, field.order)        # [nb_mesh, nb_f]
             conn_f = self._asm.field_conn[f"{name}__{element_type}"]        # [E, nb_f]
             vals_e = torch.einsum("mb,eb...->em...", interp, values[conn_f])
             out[self._asm.elements[element_type]] = vals_e
         return out
+
+    def _require_nodal(self, name: str, operation: str):
+        if self.field(name).basis == "hierarchical":
+            raise NotImplementedError(
+                f"{operation}() is not defined for hierarchical fields: "
+                "modal coefficients are not nodal point values; use "
+                "interpolate(), evaluate(), prolong() or boundary_mask() instead"
+            )
+
+    def interpolate(self, name: str, fn: Callable) -> torch.Tensor:
+        """Interpolate a physical function into nodal or modal coefficients.
+
+        Parameters
+        ----------
+        name : str
+            Trial name of the field.
+        fn : Callable
+            Receives flat physical coordinates ``[N, D]`` and returns
+            ``[N]`` or ``[N, c]``; constants may broadcast.
+
+        Returns
+        -------
+        torch.Tensor
+            Field coefficients of shape ``[n_f]`` or ``[n_f, c]``.
+
+        Notes
+        -----
+        Hierarchical interpolation solves a reference modal collocation
+        system at degree-p barycentric lattice points, without constructing
+        a monomial basis. Shared coefficients are oriented and averaged.
+        This is interpolation, not L2 projection. On curved geometry the
+        approximation is polynomial in reference coordinates.
+        """
+        from .field_evaluation import interpolate
+        return interpolate(self, name, fn)
+
+    def evaluate(self, name: str, coefficients: torch.Tensor, points: torch.Tensor,
+                 element_type: Optional[str] = None, cell_indices=None,
+                 physical: bool = False, gradient: bool = False,
+                 max_iterations: int = 30, tolerance: Optional[float] = None) -> torch.Tensor:
+        """Evaluate coefficients on explicitly selected cells.
+
+        Parameters
+        ----------
+        name : str
+            Trial name of the field.
+        coefficients : torch.Tensor
+            Shape ``[n_f, ...]``, on the mesh's device.
+        points : torch.Tensor
+            Shared ``[Q, D]`` or per-cell ``[n_selected_cells, Q, D]`` points.
+        element_type : str, optional
+            Required only for mixed-element meshes.
+        cell_indices : int or sequence of int, optional
+            Cells of the selected element type; defaults to all cells.
+        physical : bool, optional
+            Interpret points as physical instead of reference coordinates.
+        gradient : bool, optional
+            Return physical gradients instead of values.
+        max_iterations : int, optional
+            Maximum Newton iterations for physical inversion. Default 30.
+        tolerance : float, optional
+            Physical inversion residual tolerance; defaults to a value
+            scaled with coordinate magnitude and machine precision.
+
+        Returns
+        -------
+        torch.Tensor
+            Values ``[n_selected_cells, Q, ...]``; gradients append axis D.
+
+        Notes
+        -----
+        Physical evaluation inverts triangle geometry with batched Newton
+        iteration, seeded by corner-affine coordinates. Outside points and
+        nonconvergence raise ValueError. This is not a global point locator;
+        curved maps must be valid and invertible.
+        """
+        from .field_evaluation import evaluate
+        return evaluate(self, name, coefficients, points, element_type, cell_indices,
+                        physical, gradient, max_iterations, tolerance)
+
+    def dirichlet_values(self, name: str, fn: Callable,
+                         component: Optional[int] = None) -> torch.Tensor:
+        """Lift prescribed data on the entire topological boundary.
+
+        Parameters
+        ----------
+        name : str
+            Trial name of the field.
+        fn : Callable
+            Boundary function with the same calling convention as interpolate.
+            It is called only at boundary points, never cell interiors.
+        component : int, optional
+            Select one scalar vector component; None expands all components.
+
+        Returns
+        -------
+        torch.Tensor
+            Full block-vector lifting ``[N]``. Bubbles, unconstrained
+            coefficients and other field blocks are zero.
+
+        Notes
+        -----
+        Combine with boundary_mask and Condenser. Modal traces are expanded
+        in vertex/edge functions using Lobatto-type samples; nonpolynomial
+        traces are interpolated rather than represented exactly.
+        """
+        from .field_evaluation import dirichlet_values
+        return dirichlet_values(self, name, fn, component)
 
     def split(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         r"""Split a DOF vector ``[N, ...]`` into per-field tensors.
@@ -317,6 +455,8 @@ class BlockLayout:
         Every field must be given, either as a tensor of shape
         ``[n_f, c_f]`` / ``[n_f * c_f]`` (or ``[n_f]`` for scalar fields)
         or as a python scalar that is broadcast (e.g. ``p=0.0``).
+        A broadcast scalar fills *coefficients*: for hierarchical fields,
+        a nonzero scalar here does not represent a constant physical field.
         """
         given = dict(fields or {})
         given.update(kwargs)
@@ -363,7 +503,7 @@ class BlockLayout:
         where : Callable, optional
             Coordinate predicate: called with the field's node coordinates
             ``[n_f, D]`` (see :meth:`points`), must return a bool ``[n_f]``
-            mask. Works for every field kind; mutually exclusive with
+            mask. Nodal fields only; mutually exclusive with
             ``node_mask``. Example: ``where=lambda x: x[:, 1] > 1 - 1e-6``.
         """
         f, n_f, c = self.field(name), self.n_nodes(name), self.field(name).components
@@ -409,7 +549,9 @@ class BlockLayout:
             f = self.field(name)
             conn = {element_type: self._asm.field_conn[f"{name}__{element_type}"]
                     for element_type in self._asm.element_types}
-            self._boundary_cache[name] = lagrange_boundary_mask(
+            mask_fn = (hierarchical_boundary_mask if f.basis == "hierarchical"
+                       else lagrange_boundary_mask)
+            self._boundary_cache[name] = mask_fn(
                 conn, f.order, self.n_nodes(name))
         node_sel = self._boundary_cache[name].to(self._asm._points.device)
         return self.dof_mask(name, node_mask=node_sel, component=component)
@@ -426,7 +568,7 @@ class BlockLayout:
         if self._asm.field_kind[name] != "nodes":
             raise ValueError(
                 f"field {name!r} has topological DOF carriers, not mesh nodes — "
-                f"select its DOFs via dof_mask(where=...) or boundary_mask()"
+                f"select its DOFs via explicit coefficient masks or boundary_mask()"
             )
         f, c = self.field(name), self.field(name).components
         assert 0 <= component < c, f"component must be in [0, {c}), got {component}"
@@ -504,6 +646,7 @@ class MixedElementAssembler(nn.Module):
         self.field_node_ids: BufferDict = topology["field_node_ids"]
         self.field_g2l: BufferDict = topology["field_g2l"]
         self.field_conn: BufferDict = topology["field_conn"]
+        self.field_sign: BufferDict = topology.get("field_sign", BufferDict())
         self.field_ref_nodes: BufferDict = topology["field_ref_nodes"]
         self.ref_val: BufferDict = topology["ref_val"]
         self.ref_grad: BufferDict = topology["ref_grad"]
@@ -516,7 +659,7 @@ class MixedElementAssembler(nn.Module):
         self.dimension: int = element_type2dimension[self.element_types[0]]
         self.mesh_order: int = topology["mesh_order"]
         self.n_points: int = topology["n_points"]
-        self.field_kind: Dict[str, str] = topology["field_kind"]        # "nodes" | "dofmap"
+        self.field_kind: Dict[str, str] = topology["field_kind"]  # nodes | dofmap | hierarchical
         self.field_n_nodes: Dict[str, int] = topology["field_n_nodes"]
 
         self._offsets: Dict[str, int] = {}
@@ -616,8 +759,8 @@ class MixedElementAssembler(nn.Module):
         Parameters
         ----------
         mesh : tensormesh.Mesh
-            Source mesh; its element order is the geometry (and maximum
-            field) order.
+            Source mesh; its element order defines the geometry order,
+            independently of field orders.
         quadrature_order : int, optional
             Triangle polynomial exactness degree. Defaults to
             ``2 * max(field.order)``, sufficient for constant-coefficient
@@ -655,16 +798,24 @@ class MixedElementAssembler(nn.Module):
             raise ValueError("quadrature_order must be an integer >= 1")
 
         # ---- per-field DOF carriers and field-local connectivity ---- #
-        # orders 1 / mesh_order ride on mesh nodes ("nodes" kind, keeps the
-        # mesh-point numbering); any other order gets a topological DOF map.
+        # Lagrange orders 1 / mesh_order ride on mesh nodes; other orders
+        # and all hierarchical fields get a topological DOF map.
         field_kind: Dict[str, str] = {}
         field_n_nodes: Dict[str, int] = {}
         field_node_ids: Dict[str, torch.Tensor] = {}
         field_g2l: Dict[str, torch.Tensor] = {}
         field_conn: Dict[str, torch.Tensor] = {}
+        field_sign: Dict[str, torch.Tensor] = {}
         field_ref_nodes: Dict[str, torch.Tensor] = {}
         for f in cls.fields:
-            if f.order == mesh_order:
+            if f.basis == "hierarchical":
+                field_kind[f.trial] = "hierarchical"
+                dofmap = hierarchical_dofmap(elements, n_points, f.order)
+                conn = dofmap.conn
+                field_n_nodes[f.trial] = dofmap.n_dofs
+                for element_type, sign in dofmap.sign.items():
+                    field_sign[f"{f.trial}__{element_type}"] = sign.to(dtype=points.dtype)
+            elif f.order == mesh_order:
                 field_kind[f.trial] = "nodes"
                 node_ids = torch.arange(n_points, dtype=torch.long)
                 g2l = torch.arange(n_points, dtype=torch.long)
@@ -699,6 +850,10 @@ class MixedElementAssembler(nn.Module):
         ref_val: Dict[str, torch.Tensor] = {}
         ref_grad: Dict[str, torch.Tensor] = {}
         geom_ref_grad: Dict[str, torch.Tensor] = {}
+        # Reuse reference tabulation for fields with the same family/order.
+        # Quadrature, dtype and device are fixed for each element type here;
+        # no element-dependent data or signs enter these reference tables.
+        reference_tables = {}
         for element_type, value in elements.items():
             trans = Transformation(
                 points=points,
@@ -713,8 +868,16 @@ class MixedElementAssembler(nn.Module):
                 elem_cls.get_basis_grad_fns(mesh_order, q.dtype, q.device).map(q)  # [n_q, D, nb_mesh]
             for f in cls.fields:
                 key = f"{f.trial}__{element_type}"
-                ref_val[key] = elem_cls.eval_shape_val(q, f.order)                      # [n_q, nb_f]
-                ref_grad[key] = elem_cls.get_basis_grad_fns(f.order, q.dtype, q.device).map(q)
+                cache_key = (element_type, f.order, f.basis)
+                if cache_key not in reference_tables:
+                    if f.basis == "hierarchical":
+                        basis = elem_cls.get_hierarchical_basis_fns(f.order, q.dtype, q.device)
+                        val, grad = basis.map(q), basis.grad().map(q)
+                    else:
+                        val = elem_cls.eval_shape_val(q, f.order)
+                        grad = elem_cls.get_basis_grad_fns(f.order, q.dtype, q.device).map(q)
+                    reference_tables[cache_key] = val, grad
+                ref_val[key], ref_grad[key] = reference_tables[cache_key]
 
         # ---- per-(test, trial) pair: edge pattern, scatter, expanded COO ---- #
         pair_projector: Dict[str, ReduceProjector] = {}
@@ -763,6 +926,7 @@ class MixedElementAssembler(nn.Module):
             "field_node_ids": BufferDict(field_node_ids),
             "field_g2l": BufferDict(field_g2l),
             "field_conn": BufferDict(field_conn),
+            "field_sign": BufferDict(field_sign),
             "field_ref_nodes": BufferDict(field_ref_nodes),
             "ref_val": BufferDict(ref_val),
             "ref_grad": BufferDict(ref_grad),
@@ -1088,6 +1252,15 @@ class MixedElementAssembler(nn.Module):
                 key: values[self.field_conn[f"{fname}__{element_type}"]]
                 for key, (fname, values) in field_data.items()
             }  # {key: [E, nb_f, ...]}
+            # Modal field_data holds global coefficients, not point values.
+            # Orient the gathered coefficients once per element type, so both
+            # value and gradient interpolation can use the shared unsigned tables.
+            for key, (fname, _) in field_data.items():
+                sign_key = f"{fname}__{element_type}"
+                if sign_key in self.field_sign:
+                    data = ele_field_data[key]
+                    sign = self.field_sign[sign_key]
+                    ele_field_data[key] = data * sign.reshape(*sign.shape, *((1,) * (data.ndim - 2)))
             element_coords = trans.element_coords  # [E, nb_mesh, D]
 
             for i in range(n_batch):
@@ -1140,6 +1313,23 @@ class MixedElementAssembler(nn.Module):
 
                 yield element_type, jxw, tables_val, tables_grad, data_args
 
+    def _orient_contribution(self, local, element_type, beta, alpha=None):
+        """Apply test/trial signs after quadrature and before global scatter.
+
+        This avoids allocating signed [E,Q,b] reference tables or adding an
+        element axis to value-only vmap passes. Vector components share the
+        scalar basis orientation. field_data is oriented separately on gather.
+        """
+        test_key = f"{beta.trial}__{element_type}"
+        if test_key in self.field_sign:
+            sign = self.field_sign[test_key]
+            local = local * sign.reshape(*sign.shape, *((1,) * (local.ndim - 2)))
+        if alpha is not None:
+            trial_key = f"{alpha.trial}__{element_type}"
+            if trial_key in self.field_sign:
+                local = local * self.field_sign[trial_key][:, None, :, None, None]
+        return local
+
     # ------------------------------------------------------------------ #
     # assembly
     # ------------------------------------------------------------------ #
@@ -1166,6 +1356,8 @@ class MixedElementAssembler(nn.Module):
             its ``grad``-prefixed form) becomes a ``forward`` argument,
             interpolated with that field's own basis — e.g. a previous
             Picard iterate of a generalized-order velocity field.
+            For hierarchical fields, ``values`` are global modal coefficients;
+            local orientation signs apply to value and gradient interpolation.
 
         Returns
         -------
@@ -1207,7 +1399,9 @@ class MixedElementAssembler(nn.Module):
             total = None
             for element_type in self.element_types:
                 proj = self.pair_projector[f"{beta.trial}__{alpha.trial}__{element_type}"]
-                projected = proj(acc[(alpha.trial, beta.trial, element_type)])  # [n_pair_edges, c_b, c_a]
+                local = self._orient_contribution(
+                    acc[(alpha.trial, beta.trial, element_type)], element_type, beta, alpha)
+                projected = proj(local)  # [n_pair_edges, c_b, c_a]
                 total = projected if total is None else total + projected
             pass_vals[(alpha.trial, beta.trial)] = total
 
@@ -1324,8 +1518,8 @@ class MixedElementAssembler(nn.Module):
             seg = torch.zeros(n_f, c, dtype=dtype, device=device)
             for element_type in self.element_types:
                 conn = self.field_conn[f"{beta.trial}__{element_type}"]  # [E, nb_f]
-                seg.index_add_(0, conn.reshape(-1),
-                               acc[(beta.trial, element_type)].reshape(-1, c))
+                local = self._orient_contribution(acc[(beta.trial, element_type)], element_type, beta)
+                seg.index_add_(0, conn.reshape(-1), local.reshape(-1, c))
             off = self._offsets[beta.trial]
             out_vec[off:off + n_f * c] = seg.reshape(-1)
         return out_vec

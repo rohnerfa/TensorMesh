@@ -15,7 +15,7 @@ Element Assembler
 Mixed Element Assembler
 -----------------------
 
-Multi-field (block) bilinear and linear forms on Lagrange spaces —
+Multi-field (block) bilinear and linear forms on Lagrange or hierarchical spaces —
 e.g. Taylor-Hood Stokes — declared field-by-field and assembled into
 one block sparse matrix. See the :doc:`user guide chapter
 </user_guide/mixed_assembly>` for a tutorial.
