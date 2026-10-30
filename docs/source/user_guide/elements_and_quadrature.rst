@@ -307,17 +307,25 @@ its historical meaning depends on the shape:
 * **Lines, quads and hexes:** number of Gaussian points per direction,
   exact through degree ``2 * order - 1`` in each coordinate. There is no
   longer a seven-point limit.
-* **Tetrahedra:** exactness degree, still limited to tables 1–7.
+* **Tetrahedra:** requested total polynomial exactness degree. Orders 1–7
+  retain the original tables and point ordering, including negative weights
+  and boundary points. Degrees above 7 use a generated conical Gaussian
+  product with :math:`\lceil(d+1)/2\rceil^3` points. Generated weights are
+  positive and points lie strictly inside the reference tetrahedron; the
+  rules are not symmetric or minimal-point rules. See the legacy exactness
+  note below.
 * **Pyramids:** points per collapsed direction. **Prisms:** triangle
   exactness degree and number of line points, preserving the mixed convention.
 
-For affine triangles with constant coefficients, stiffness needs degree
+For affine triangles and tetrahedra with constant coefficients, stiffness needs degree
 ``2*p - 2`` and mass needs ``2*p``. The mixed assembler defaults to
 ``quadrature_order = 2 * max(field.order)`` and accepts an explicit override.
 Curved geometry, nonpolynomial coefficients and nonlinear forms generally
 require quadrature-convergence checks rather than a polynomial-exactness
-claim. Reference rules are generated in CPU float64 and converted to the
-requested dtype/device; arbitrary degree is subject to precision and cost.
+claim. Internal rule generators cache CPU float64 data and return independent
+copies in the requested dtype/device. :meth:`~tensormesh.Element.get_quadrature`
+also has its own cache of returned tensors; clone these tensors before
+modifying them. Arbitrary degree is subject to precision and cost.
 
 .. code-block:: python
 
@@ -334,6 +342,53 @@ family; see ``tensormesh/element/quadrature.py`` for the tables and generators.
 
    w, q = Triangle.get_quadrature(order=20, dtype=torch.float64)
    assert w.shape == (121,)  # 11 x 11 conical Gaussian rule
+
+Generated tetrahedral rules use the map from :math:`[0,1]^3`
+
+.. math::
+
+   x=u,\qquad y=(1-u)v,\qquad z=(1-u)(1-v)w.
+
+Its Jacobian :math:`(1-u)^2(1-v)` is included in the Gaussian weights:
+Gauss–Jacobi for :math:`(1-u)^2` and :math:`(1-v)`, and Gauss–Legendre in
+:math:`w`. A monomial :math:`x^a y^b z^c` then has polynomial degrees
+:math:`a+b+c`, :math:`b+c`, and :math:`c` in the three integration variables,
+after accounting for the weighted Jacobian. Thus
+:math:`n=\lceil(d+1)/2\rceil` points per variable integrate every monomial of
+total degree at most :math:`d`. Independent reference moments are
+
+.. math::
+
+   \int_{\hat K} x^a y^b z^c\,dx\,dy\,dz
+       = \frac{a!\,b!\,c!}{(a+b+c+3)!},
+   \qquad |\hat K| = \frac{1}{6}.
+
+.. code-block:: python
+
+   import torch
+   from tensormesh import Tetrahedron
+
+   weights, points = Tetrahedron.get_quadrature(order=20, dtype=torch.float64)
+   assert weights.shape == (1331,)  # 11 x 11 x 11 conical Gaussian rule
+   assert points.shape == (1331, 3)
+   torch.testing.assert_close(weights.sum(), torch.tensor(1 / 6, dtype=torch.float64))
+
+Tetrahedral triangular faces continue to use the triangle rules, including
+generated triangle rules above degree 7.
+
+.. note::
+
+   An analytical-moment audit of the preserved tetrahedral tables finds that
+   orders 1–4 meet their advertised degree, but orders 5, 6, and 7 are exact
+   only through degrees 4, 5, and 6, respectively. For example, the order-5
+   rule gives :math:`\int x^5 \approx 0.00295569881403488` instead of
+   :math:`1/336`, the order-6 rule gives
+   :math:`\int x^6 \approx 0.00197324377011877` instead of :math:`1/504`,
+   and the order-7 rule gives
+   :math:`\int x^7 \approx 0.00139205670790233` instead of :math:`1/720`.
+   These legacy tables are retained for numerical compatibility. Explicitly
+   request ``order >= 8`` when the missing higher moments are needed,
+   including when overriding the mixed assembler's default for such forms.
 
 
 Step 5 — Reference shape values (``eval_shape_val``)
