@@ -619,9 +619,13 @@ class MixedElementAssembler(nn.Module):
             Source mesh; its element order is the geometry (and maximum
             field) order.
         quadrature_order : int, optional
-            Degree of exactness of the quadrature rule. Defaults to
-            ``2 * max(field.order)``, which integrates every product of
-            two field values/gradients exactly on affine elements.
+            Triangle polynomial exactness degree. Defaults to
+            ``2 * max(field.order)``, sufficient for constant-coefficient
+            mass/stiffness products on affine triangles. Higher-degree
+            coefficients, nonlinear forms and curved geometry may require
+            an explicit larger value and quadrature-convergence checks.
+            Other shapes retain their existing rule conventions (e.g. line/
+            tensor-product orders count points; tetrahedra have tables 1..7).
         *args, **kwargs
             Additional arguments forwarded to ``__post_init__``.
         """
@@ -644,14 +648,11 @@ class MixedElementAssembler(nn.Module):
         mesh_order = next(iter(orders.values()))
         if quadrature_order is None:
             quadrature_order = 2 * max(f.order for f in cls.fields)
-            if quadrature_order > 7:
-                raise ValueError(
-                    f"the default quadrature degree {quadrature_order} (= 2 * max "
-                    f"field order) exceeds the tabulated maximum of 7 — pass "
-                    f"quadrature_order <= 7 explicitly (products of two highest-"
-                    f"order fields then integrate inexactly) or extend the "
-                    f"quadrature tables"
-                )
+        # Rule capability is shape-specific; triangle rules are generated
+        # above degree 7, while unsupported shapes validate in their factory.
+        if (isinstance(quadrature_order, bool) or not isinstance(quadrature_order, int)
+                or quadrature_order < 1):
+            raise ValueError("quadrature_order must be an integer >= 1")
 
         # ---- per-field DOF carriers and field-local connectivity ---- #
         # orders 1 / mesh_order ride on mesh nodes ("nodes" kind, keeps the
