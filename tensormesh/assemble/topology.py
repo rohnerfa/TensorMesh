@@ -14,6 +14,10 @@ reusing mesh nodes. This is what decouples the field order from the
 mesh order (generalized Taylor–Hood pairs, quadratic fields on linear
 gmsh imports); :func:`lagrange_boundary_mask` marks its boundary DOFs
 by facet incidence, without any geometric predicate.
+
+:func:`hierarchical_dofmap` shares the vertex/edge entity numbering for
+triangle modal spaces, keeping edge modes in degree order and returning
+parity-dependent orientation signs instead of reversing nodal indices.
 """
 from typing import Dict, List, Mapping, NamedTuple, Tuple
 
@@ -21,10 +25,11 @@ import numpy as np
 import scipy.sparse
 import torch
 
-from ..element import element_type2element, element_type2order
+from ..element import Triangle, element_type2element, element_type2order
 
 __all__ = ["build_edges", "lagrange_dofmap", "lagrange_boundary_mask", "boundary_facet_mask",
-           "LagrangeDofMap"]
+           "LagrangeDofMap", "HierarchicalDofMap", "hierarchical_dofmap",
+           "hierarchical_boundary_mask"]
 
 
 def build_edges(
@@ -128,6 +133,120 @@ class LagrangeDofMap(NamedTuple):
     ref_nodes: Dict[str, torch.Tensor]
 
 
+class HierarchicalDofMap(NamedTuple):
+    r"""Triangle modal connectivity and local-to-global orientation factors.
+
+    ``conn[type][K, i]`` indexes the global coefficient of local function i.
+    For a global coefficient vector u, use
+    ``u_local = sign[type] * u[conn[type]]`` before basis evaluation.
+    Equivalently multiply each local basis function by its sign. Signs must
+    act on both test and trial functions in assembly, including load vectors.
+
+    Numbering is compact vertices, unique sorted edges (ascending degree
+    within each edge), then private cell interiors. Outputs are CPU tensors:
+    conn and vertex_ids are long; sign is int8 (+1 or -1), ready to cast
+    once to the assembly dtype/device. vertex_ids records the original mesh
+    point IDs in sorted order. Unlike LagrangeDofMap, there are no ref_nodes:
+    modal coefficients do not represent values at interpolation points.
+    """
+    conn: Dict[str, torch.Tensor]
+    sign: Dict[str, torch.Tensor]
+    n_dofs: int
+    vertex_ids: torch.Tensor
+
+
+def _number_vertices_and_edges(per_etype, n_points, order):
+    """Shared entity numbering; values are (element class, corner IDs)."""
+    vertex_ids = torch.unique(torch.cat([c.reshape(-1) for _, c in per_etype.values()]))
+    g2l = torch.full((n_points,), -1, dtype=torch.long)
+    g2l[vertex_ids] = torch.arange(vertex_ids.shape[0], dtype=torch.long)
+    edge_ids = {}
+    n_global_edges = 0
+    if order >= 2:
+        chunks, sizes = [], []
+        for element_type, (elem_cls, corners) in per_etype.items():
+            pairs = corners[:, elem_cls.edge]
+            chunks.append(torch.sort(pairs, dim=-1).values.reshape(-1, 2))
+            sizes.append((element_type, pairs.shape[0], pairs.shape[1]))
+        unique_edges, inverse = torch.unique(torch.cat(chunks, dim=0), dim=0,
+                                            return_inverse=True)
+        n_global_edges = unique_edges.shape[0]
+        offset = 0
+        for element_type, n_element, n_le in sizes:
+            edge_ids[element_type] = inverse[offset:offset + n_element * n_le] \
+                .reshape(n_element, n_le)
+            offset += n_element * n_le
+    return vertex_ids, g2l, edge_ids, n_global_edges
+
+
+def hierarchical_dofmap(elements: Mapping[str, torch.Tensor],
+                        n_points: int, order: int) -> HierarchicalDofMap:
+    r"""Build the uniform-order hierarchical H1 DOF map for triangles only.
+
+    The API parallels lagrange_dofmap. Only the first three connectivity
+    columns (corner vertices) are read, independently of geometry order.
+    Local ordering matches Triangle.get_hierarchical_basis_fns: vertices,
+    edges (1,2), (0,2), (0,1) with degrees n=2,...,order, then interiors.
+    Edge direction is canonical from smaller to larger mesh vertex ID.
+    Reversed edges get (-1)**n, never a reversal of mode indices.
+
+    Entity numbering is shared with lagrange_dofmap, but no nodal basis
+    construction or reference-node classification is needed. Setup is
+    vectorized over cells; only element types are iterated in Python.
+    Connectivity may reside on any device; outputs are on CPU, as used by
+    the assemblers' topology setup. Unsupported element types are rejected.
+    """
+    if isinstance(order, bool) or not isinstance(order, int) or order < 1:
+        raise ValueError("triangle order must be an integer >= 1")
+    if not elements:
+        raise ValueError("elements must contain at least one triangle type")
+    if isinstance(n_points, bool) or not isinstance(n_points, int) or n_points < 0:
+        raise ValueError("n_points must be a nonnegative integer")
+    per_etype = {}
+    for element_type, value in elements.items():
+        elem_cls = element_type2element(element_type)
+        if elem_cls is not Triangle:
+            raise NotImplementedError("hierarchical DOF maps support triangles only")
+        if value.ndim != 2 or value.shape[1] < 3:
+            raise ValueError("triangle connectivity must have shape [n_element, >=3]")
+        if value.dtype not in (torch.int32, torch.int64):
+            raise ValueError("triangle connectivity must contain integer point IDs")
+        corners = value[:, :3].detach().cpu().long()
+        if ((corners < 0) | (corners >= n_points)).any():
+            raise ValueError("triangle vertex IDs must lie in [0, n_points)")
+        sorted_corners = corners.sort(dim=1).values
+        if (sorted_corners[:, 1:] == sorted_corners[:, :-1]).any():
+            raise ValueError("a triangle must have three distinct vertex IDs")
+        per_etype[element_type] = (elem_cls, corners)
+
+    vertex_ids, g2l, edge_ids, n_edges = _number_vertices_and_edges(per_etype, n_points, order)
+    n_vertex = vertex_ids.numel()
+    n_interior = (order - 1) * (order - 2) // 2
+    interior_base = n_vertex + n_edges * (order - 1)
+    n_basis = (order + 1) * (order + 2) // 2
+    conn, sign = {}, {}
+    for element_type, (elem_cls, corners) in per_etype.items():
+        n_element = corners.shape[0]
+        out = torch.empty((n_element, n_basis), dtype=torch.long)
+        factors = torch.ones((n_element, n_basis), dtype=torch.int8)
+        out[:, :3] = g2l[corners]
+        if order >= 2:
+            modes = torch.arange(order - 1)
+            out[:, 3:3 * order] = (n_vertex + edge_ids[element_type][..., None]
+                                   * (order - 1) + modes).reshape(n_element, 3 * (order - 1))
+            pairs = corners[:, elem_cls.edge]
+            reversed_edge = pairs[..., 0] > pairs[..., 1]
+            odd_degree = (modes + 2) % 2 == 1
+            factors[:, 3:3 * order] = torch.where(
+                reversed_edge[..., None] & odd_degree, -1, 1
+            ).reshape(n_element, 3 * (order - 1)).to(torch.int8)
+        out[:, 3 * order:] = (interior_base + torch.arange(n_element)[:, None]
+                              * n_interior + torch.arange(n_interior))
+        conn[element_type], sign[element_type] = out, factors
+        interior_base += n_element * n_interior
+    return HierarchicalDofMap(conn, sign, interior_base, vertex_ids)
+
+
 def _classify_reference_nodes(elem_cls, order: int):
     """Slot classification of the reference Lagrange nodes.
 
@@ -182,29 +301,10 @@ def lagrange_dofmap(elements: Mapping[str, torch.Tensor],
         corners = value[:, :elem_cls.n_vertex].long()        # [E, n_vertex] mesh ids
         per_etype[element_type] = (elem_cls, slots, n_interior, corners)
 
-    # vertex DOFs: compact renumbering of the used corner vertices
-    vertex_ids = torch.unique(torch.cat([c.reshape(-1) for *_ , c in per_etype.values()]))
-    g2l = torch.full((n_points,), -1, dtype=torch.long)
-    g2l[vertex_ids] = torch.arange(vertex_ids.shape[0], dtype=torch.long)
+    vertex_ids, g2l, edge_ids, n_global_edges = _number_vertices_and_edges(
+        {key: (elem_cls, corners) for key, (elem_cls, _, _, corners) in per_etype.items()},
+        n_points, order)
     n_vertex_dofs = vertex_ids.shape[0]
-
-    # unique (undirected) edges across all element types
-    edge_ids = {}
-    n_global_edges = 0
-    if order >= 2:
-        chunks, sizes = [], []
-        for element_type, (elem_cls, _, _, corners) in per_etype.items():
-            pairs = corners[:, elem_cls.edge]                # [E, n_le, 2] mesh ids
-            chunks.append(torch.sort(pairs, dim=-1).values.reshape(-1, 2))
-            sizes.append((element_type, pairs.shape[0], pairs.shape[1]))
-        cat = torch.cat(chunks, dim=0)
-        unique_edges, inverse = torch.unique(cat, dim=0, return_inverse=True)
-        n_global_edges = unique_edges.shape[0]
-        offset = 0
-        for element_type, n_element, n_le in sizes:
-            edge_ids[element_type] = inverse[offset:offset + n_element * n_le] \
-                .reshape(n_element, n_le)
-            offset += n_element * n_le
 
     edge_base = n_vertex_dofs
     interior_base = n_vertex_dofs + n_global_edges * (order - 1)
@@ -281,6 +381,38 @@ def lagrange_boundary_mask(conn: Mapping[str, torch.Tensor],
     mask = torch.zeros(n_dofs, dtype=torch.bool)
     boundary_nodes = torch.cat(facet_nodes, dim=0)[is_boundary_facet].reshape(-1)
     mask[boundary_nodes] = True
+    return mask
+
+
+def hierarchical_boundary_mask(conn: Mapping[str, torch.Tensor],
+                               order: int, n_dofs: int) -> torch.Tensor:
+    """Mark triangle boundary vertices and all boundary edge modes, never bubbles.
+
+    Only endpoint incidence identifies boundary edges; no modal coefficient
+    is interpreted as a point value. Local slots follow the hierarchical
+    vertex/edge/interior ordering, independently of geometry order.
+    """
+    if isinstance(order, bool) or not isinstance(order, int) or order < 1:
+        raise ValueError("triangle order must be an integer >= 1")
+    if not conn:
+        raise ValueError("conn must contain at least one triangle type")
+    keys, traces = [], []
+    device = next(iter(conn.values())).device
+    edges = Triangle.edge.to(device)
+    modes = 3 + torch.arange(3, device=device)[:, None] * (order - 1) \
+        + torch.arange(order - 1, device=device)
+    slots = torch.cat((edges, modes), dim=1)
+    for kind, value in conn.items():
+        if element_type2element(kind) is not Triangle:
+            raise NotImplementedError("hierarchical boundary masks support triangles only")
+        if value.ndim != 2 or value.shape[1] != (order + 1) * (order + 2) // 2:
+            raise ValueError("hierarchical connectivity width must match the polynomial order")
+        keys.append(value[:, edges].sort(dim=-1).values.reshape(-1, 2))
+        traces.append(value[:, slots].reshape(-1, order + 1))
+    _, inverse, counts = torch.unique(torch.cat(keys), dim=0, return_inverse=True,
+                                      return_counts=True)
+    mask = torch.zeros(n_dofs, dtype=torch.bool, device=device)
+    mask[torch.cat(traces)[counts[inverse] == 1].reshape(-1)] = True
     return mask
 
 
