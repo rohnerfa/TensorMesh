@@ -82,6 +82,7 @@ design choices, and how to wield each component.
    meshes
    elements_and_quadrature
    hierarchical_triangles
+   hierarchical_tetrahedra
    forms
    mixed_assembly
    boundary_conditions
