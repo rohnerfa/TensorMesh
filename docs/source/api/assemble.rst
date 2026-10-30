@@ -32,6 +32,20 @@ one block sparse matrix. See the :doc:`user guide chapter
     :members:
 
 
+Hierarchical Triangle Connectivity
+-----------------------------------
+
+These topological maps are independent of assembler and geometry order.
+See :doc:`/user_guide/hierarchical_triangles` for ordering and orientation.
+
+.. autoclass:: tensormesh.assemble.topology.HierarchicalDofMap
+    :no-members:
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_dofmap
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_boundary_mask
+
+
 Facet Assembler
 ---------------
 
