@@ -85,6 +85,14 @@ shape, type-string family).
     :show-inheritance:
     :no-members:
 
+.. automethod:: tensormesh.Tetrahedron.get_hierarchical_basis_fns
+
+.. autoclass:: tensormesh.element.HierarchicalTetrahedronBasisFns
+    :members: map, grad, shape
+
+.. autodata:: tensormesh.element.TETRAHEDRON_ORIENTATIONS
+    :no-value:
+
 .. autoclass:: tensormesh.Hexahedron
     :show-inheritance:
     :no-members:

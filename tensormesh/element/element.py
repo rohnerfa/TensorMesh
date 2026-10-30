@@ -2067,6 +2067,32 @@ class Tetrahedron(Element):
     n_cell   = cell.shape[0]
 
     @classmethod
+    def get_hierarchical_basis_fns(cls, order=1, dtype=torch.float32,
+                                   device=torch.device('cpu'), *, orientation=(0, 1, 2, 3)):
+        """Return vertex-oriented, non-nodal hierarchical H1 functions.
+
+        Parameters
+        ----------
+        order : int, optional
+            Polynomial degree, at least 1. Default 1.
+        dtype : torch.dtype, optional
+            Tabulation dtype. Default torch.float32.
+        device : torch.device, optional
+            Tabulation device. Default CPU.
+        orientation : tuple of int, optional
+            Local corner slots sorted by global vertex ID. Default (0, 1, 2, 3).
+
+        Returns
+        -------
+        HierarchicalTetrahedronBasisFns
+            Independent evaluator with ``map`` and ``grad().map`` interfaces.
+            See :class:`~tensormesh.element.HierarchicalTetrahedronBasisFns`
+            for entity ordering and normalization.
+        """
+        from .hierarchical_tetrahedron import HierarchicalTetrahedronBasisFns
+        return HierarchicalTetrahedronBasisFns(order, dtype, device, orientation=orientation)
+
+    @classmethod
     @lru_cache()
     @wraps(Element.get_basis)
     def get_basis(cls, 
@@ -2598,6 +2624,5 @@ class Prism(Element):
         # For the linear wedge, TensorMesh reference vertex order matches VTK/Wedge6:
         # bottom triangle (0,1,2) then top triangle (3,4,5).
         return torch.arange(6, device=device, dtype=torch.long)
-
 
 

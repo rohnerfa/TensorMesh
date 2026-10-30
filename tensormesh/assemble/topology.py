@@ -18,6 +18,8 @@ by facet incidence, without any geometric predicate.
 :func:`hierarchical_dofmap` shares the vertex/edge entity numbering for
 triangle modal spaces, keeping edge modes in degree order and returning
 parity-dependent orientation signs instead of reversing nodal indices.
+Tetrahedral modal spaces use :func:`hierarchical_tetrahedron_dofmap` and
+vertex-oriented reference evaluators, with no coefficient signs.
 """
 from typing import Dict, List, Mapping, NamedTuple, Tuple
 
@@ -25,11 +27,13 @@ import numpy as np
 import scipy.sparse
 import torch
 
-from ..element import Triangle, element_type2element, element_type2order
+from ..element import (TETRAHEDRON_ORIENTATIONS, Tetrahedron, Triangle,
+                       element_type2element, element_type2order)
 
 __all__ = ["build_edges", "lagrange_dofmap", "lagrange_boundary_mask", "boundary_facet_mask",
            "LagrangeDofMap", "HierarchicalDofMap", "hierarchical_dofmap",
-           "hierarchical_boundary_mask"]
+           "hierarchical_boundary_mask", "HierarchicalTetrahedronDofMap",
+           "hierarchical_tetrahedron_dofmap", "hierarchical_tetrahedron_boundary_mask"]
 
 
 def build_edges(
@@ -245,6 +249,260 @@ def hierarchical_dofmap(elements: Mapping[str, torch.Tensor],
         conn[element_type], sign[element_type] = out, factors
         interior_base += n_element * n_interior
     return HierarchicalDofMap(conn, sign, interior_base, vertex_ids)
+
+
+class _TetrahedronTopology(NamedTuple):
+    """CPU corner/entity data shared across field orders; treat as immutable.
+
+    Entity IDs are lexicographic in original mesh point IDs. Per-type rows
+    retain original cell order. ``face_representatives[f]`` contains an
+    element-type index (in ``corners`` insertion order), original cell ID,
+    and local face slot of the first incidence of face f.
+    """
+    vertex_ids: torch.Tensor
+    corners: Dict[str, torch.Tensor]
+    vertex_conn: Dict[str, torch.Tensor]
+    edges: torch.Tensor
+    faces: torch.Tensor
+    edge_ids: Dict[str, torch.Tensor]
+    face_ids: Dict[str, torch.Tensor]
+    face_counts: torch.Tensor
+    orientation: Dict[str, torch.Tensor]
+    groups: Dict[str, Dict[int, torch.Tensor]]
+    face_representatives: torch.Tensor
+    boundary_faces: torch.Tensor
+    n_points: int
+
+
+class HierarchicalTetrahedronDofMap(NamedTuple):
+    """Uniform-order tetrahedral modal connectivity without orientation signs.
+
+    Attributes
+    ----------
+    conn : Dict[str, torch.Tensor]
+        CPU long connectivity ``[n_element, (p+1)*(p+2)*(p+3)//6]``.
+        Local ordering is vertices, six edge blocks, four face blocks, then
+        private cell modes, matching the oriented tetrahedral evaluator.
+    n_dofs : int
+        Number of scalar coefficients, in compact vertex / unique edge /
+        unique face / private cell order. Interiors follow original cell
+        order within each element type, then mapping insertion order.
+    vertex_ids : torch.Tensor
+        Sorted original mesh point IDs of the compact vertex coefficients.
+    topology : object
+        Reusable private CPU topology, independent of field degree. Pass it
+        to :func:`hierarchical_tetrahedron_dofmap` for another order on the
+        same mesh. Treat its tensors as immutable.
+
+    Notes
+    -----
+    Edge/face coordinates are oriented inside the basis evaluator, so
+    coefficients are gathered directly with ``conn``. Modal coefficients
+    are not nodal values; there are no coefficient coordinates or signs.
+    """
+    conn: Dict[str, torch.Tensor]
+    n_dofs: int
+    vertex_ids: torch.Tensor
+    topology: object
+
+
+def _tetrahedron_corners(elements, n_points):
+    """Validate corner connectivity independently of geometry's other nodes."""
+    if isinstance(n_points, bool) or not isinstance(n_points, int) or n_points < 0:
+        raise ValueError("n_points must be a nonnegative integer")
+    if not elements:
+        raise ValueError("elements must contain at least one tetrahedron type")
+    corners = {}
+    for kind, value in elements.items():
+        if kind not in element_type2order:
+            raise ValueError(f"unknown element type '{kind}'")
+        if element_type2element(kind) is not Tetrahedron:
+            raise NotImplementedError("hierarchical tetrahedron topology supports tetrahedra only")
+        if not isinstance(value, torch.Tensor) or value.ndim != 2 or value.shape[1] < 4:
+            raise ValueError("tetrahedron connectivity must have shape [n_element, >=4]")
+        if value.dtype not in (torch.int32, torch.int64):
+            raise ValueError("tetrahedron connectivity must contain integer point IDs")
+        ids = value[:, :4].detach().cpu().long()
+        if ((ids < 0) | (ids >= n_points)).any():
+            raise ValueError("tetrahedron vertex IDs must lie in [0, n_points)")
+        ordered = ids.sort(dim=1).values
+        if (ordered[:, 1:] == ordered[:, :-1]).any():
+            raise ValueError("a tetrahedron must have four distinct vertex IDs")
+        corners[kind] = ids
+    return corners
+
+
+def _tetrahedron_topology(elements: Mapping[str, torch.Tensor], n_points: int
+                          ) -> _TetrahedronTopology:
+    """Build reusable tetrahedral entities and orientation groups on CPU.
+
+    Only the first four connectivity columns are read. All entities are
+    built, including edges/faces for linear fields. Groups contain stable
+    original cell indices per type and occupied lexicographic class ID.
+    Setup loops over types/classes, never over individual cells.
+    """
+    corners = {kind: ids.clone() for kind, ids in
+               _tetrahedron_corners(elements, n_points).items()}
+    vertex_ids = torch.unique(torch.cat([ids.reshape(-1) for ids in corners.values()]))
+    vertex_conn = {kind: torch.searchsorted(vertex_ids, ids) for kind, ids in corners.items()}
+
+    def entities(table):
+        width = table.shape[1]
+        chunks = [ids[:, table].sort(dim=-1).values.reshape(-1, width)
+                  for ids in corners.values()]
+        unique, inverse, counts = torch.unique(torch.cat(chunks), dim=0,
+                                               return_inverse=True, return_counts=True)
+        mapping, offset = {}, 0
+        for kind, ids in corners.items():
+            size = ids.shape[0] * table.shape[0]
+            mapping[kind] = inverse[offset:offset + size].reshape(-1, table.shape[0])
+            offset += size
+        return unique, mapping, counts, inverse
+
+    edges, edge_ids, _, _ = entities(Tetrahedron.edge)
+    faces, face_ids, face_counts, face_inverse = entities(torch.tensor(Tetrahedron.face))
+    # Stable grouping of face incidences yields the first original incident cell.
+    incidence_order = torch.argsort(face_inverse, stable=True)
+    starts = face_counts.cumsum(0) - face_counts
+    representatives = []
+    for type_id, ids in enumerate(corners.values()):
+        n = ids.shape[0]
+        representatives.append(torch.stack((
+            torch.full((n * 4,), type_id, dtype=torch.long),
+            torch.arange(n).repeat_interleave(4), torch.arange(4).repeat(n)), dim=-1))
+    face_representatives = torch.cat(representatives)[incidence_order[starts]]
+
+    # Base-4 codes preserve lexicographic permutation order.
+    weights = torch.tensor([64, 16, 4, 1])
+    codes = (torch.tensor(TETRAHEDRON_ORIENTATIONS) * weights).sum(-1)
+    orientation, groups = {}, {}
+    for kind, ids in corners.items():
+        classes = torch.searchsorted(codes, (ids.argsort(dim=-1) * weights).sum(-1))
+        orientation[kind] = classes
+        groups[kind] = {c: torch.nonzero(classes == c, as_tuple=True)[0]
+                        for c in classes.unique().tolist()}
+    return _TetrahedronTopology(vertex_ids, corners, vertex_conn, edges, faces,
+                                edge_ids, face_ids, face_counts, orientation, groups,
+                                face_representatives, face_counts == 1, n_points)
+
+
+def hierarchical_tetrahedron_dofmap(elements: Mapping[str, torch.Tensor],
+                                    n_points: int, order: int, *, topology=None
+                                    ) -> HierarchicalTetrahedronDofMap:
+    """Build uniform-order hierarchical H1 tetrahedral coefficient numbering.
+
+    Parameters
+    ----------
+    elements : Mapping[str, torch.Tensor]
+        Geometry connectivity ``[n_element, >=4]`` per tetrahedral type.
+        Only original corner IDs are used, independently of geometry order.
+        Inputs may reside on any device; all outputs are CPU long tensors.
+    n_points : int
+        Number of mesh points, bounding the original corner IDs.
+    order : int
+        Field polynomial degree, at least 1.
+    topology : object, optional
+        Private topology from a previous result on the same mesh. Reuses
+        all entity IDs, incidence and orientation groups across orders.
+        Connectivity is validated against its stored corners; changing
+        geometry coordinates or noncorner nodes does not invalidate it.
+
+    Returns
+    -------
+    HierarchicalTetrahedronDofMap
+        Connectivity, scalar dimension, original vertex IDs and topology.
+
+    Notes
+    -----
+    There are p-1 modes per edge, (p-1)(p-2)/2 per face for p>=3, and
+    (p-1)(p-2)(p-3)/6 private modes per cell for p>=4. Mode indices follow
+    :class:`~tensormesh.element.HierarchicalTetrahedronBasisFns`. Global
+    coefficients require no additional signs or face transformations.
+    """
+    if isinstance(order, bool) or not isinstance(order, int) or order < 1:
+        raise ValueError("tetrahedron order must be an integer >= 1")
+    if topology is None:
+        topology = _tetrahedron_topology(elements, n_points)
+    else:
+        corners = _tetrahedron_corners(elements, n_points)
+        if (not isinstance(topology, _TetrahedronTopology) or topology.n_points != n_points
+                or tuple(corners) != tuple(topology.corners)
+                or any(not torch.equal(ids, topology.corners[kind])
+                       for kind, ids in corners.items())):
+            raise ValueError("topology must match the mesh point count and ordered cell corners")
+    ne = order - 1
+    nf = (order - 1) * (order - 2) // 2 if order >= 3 else 0
+    nc = (order - 1) * (order - 2) * (order - 3) // 6 if order >= 4 else 0
+    edge_base = topology.vertex_ids.numel()
+    face_base = edge_base + topology.edges.shape[0] * ne
+    cell_base = face_base + topology.faces.shape[0] * nf
+    conn = {}
+    for kind, vertices in topology.vertex_conn.items():
+        n = vertices.shape[0]
+        edge_dofs = edge_base + topology.edge_ids[kind][..., None] * ne + torch.arange(ne)
+        face_dofs = face_base + topology.face_ids[kind][..., None] * nf + torch.arange(nf)
+        cell_dofs = cell_base + torch.arange(n)[:, None] * nc + torch.arange(nc)
+        conn[kind] = torch.cat((vertices, edge_dofs.reshape(n, 6 * ne),
+                               face_dofs.reshape(n, 4 * nf), cell_dofs), dim=1)
+        cell_base += n * nc
+    return HierarchicalTetrahedronDofMap(conn, cell_base, topology.vertex_ids, topology)
+
+
+def hierarchical_tetrahedron_boundary_mask(conn: Mapping[str, torch.Tensor],
+                                           order: int, n_dofs: int) -> torch.Tensor:
+    """Mark the closure of boundary faces in tetrahedral modal connectivity.
+
+    Parameters
+    ----------
+    conn : Mapping[str, torch.Tensor]
+        Field connectivity from :func:`hierarchical_tetrahedron_dofmap`.
+        All tensors must share a device; the first four slots carry vertices.
+    order : int
+        Field polynomial degree, at least 1.
+    n_dofs : int
+        Number of scalar coefficients (size of the returned mask).
+
+    Returns
+    -------
+    torch.Tensor
+        Boolean mask on the connectivity device. A face is on the boundary
+        iff it has exactly one incident cell. Its vertices, edge modes and
+        face modes are marked; private cell modes are never marked.
+    """
+    if isinstance(order, bool) or not isinstance(order, int) or order < 1:
+        raise ValueError("tetrahedron order must be an integer >= 1")
+    if isinstance(n_dofs, bool) or not isinstance(n_dofs, int) or n_dofs < 0:
+        raise ValueError("n_dofs must be a nonnegative integer")
+    _tetrahedron_corners(conn, n_dofs)
+    device = next(iter(conn.values())).device
+    n_basis = (order + 1) * (order + 2) * (order + 3) // 6
+    nf = (order - 1) * (order - 2) // 2 if order >= 3 else 0
+    traces = []
+    for f, face in enumerate(Tetrahedron.face):
+        slots = list(face)
+        for e, edge in enumerate(Tetrahedron.edge.tolist()):
+            if all(v in face for v in edge):
+                slots.extend(range(4 + e * (order - 1), 4 + (e + 1) * (order - 1)))
+        slots.extend(range(4 + 6 * (order - 1) + f * nf,
+                           4 + 6 * (order - 1) + (f + 1) * nf))
+        traces.append(slots)
+    slots = torch.tensor(traces, dtype=torch.long, device=device)
+    faces = torch.tensor(Tetrahedron.face, device=device)
+    keys, carriers = [], []
+    for value in conn.values():
+        if value.shape[1] != n_basis:
+            raise ValueError("hierarchical connectivity width must match the polynomial order")
+        if value.device != device:
+            raise ValueError("connectivity tensors must share a device")
+        if ((value < 0) | (value >= n_dofs)).any():
+            raise ValueError("coefficient IDs must lie in [0, n_dofs)")
+        keys.append(value[:, faces].sort(dim=-1).values.reshape(-1, 3))
+        carriers.append(value[:, slots].reshape(-1, slots.shape[1]))
+    _, inverse, counts = torch.unique(torch.cat(keys), dim=0, return_inverse=True,
+                                       return_counts=True)
+    mask = torch.zeros(n_dofs, dtype=torch.bool, device=device)
+    mask[torch.cat(carriers)[counts[inverse] == 1].reshape(-1)] = True
+    return mask
 
 
 def _classify_reference_nodes(elem_cls, order: int):
