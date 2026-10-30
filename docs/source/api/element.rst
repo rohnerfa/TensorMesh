@@ -72,6 +72,11 @@ shape, type-string family).
     :show-inheritance:
     :no-members:
 
+.. automethod:: tensormesh.Triangle.get_hierarchical_basis_fns
+
+.. autoclass:: tensormesh.element.HierarchicalTriangleBasisFns
+    :members: map, grad, shape
+
 .. autoclass:: tensormesh.Quadrilateral
     :show-inheritance:
     :no-members:
