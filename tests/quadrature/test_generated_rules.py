@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from tensormesh.element import Line, Triangle, Tetrahedron, Quadrilateral
+from tensormesh.element import Line, Triangle, Quadrilateral
 from tensormesh.element import quadrature
 
 
@@ -115,8 +115,3 @@ def test_generated_accelerator_rules(device):
 def test_invalid_orders(rule, order):
     with pytest.raises(ValueError, match="integer >= 1"):
         rule(order)
-
-
-def test_tetrahedron_limit_still_shape_specific():
-    with pytest.raises(AssertionError, match="tet quadrature"):
-        Tetrahedron.get_quadrature(8)

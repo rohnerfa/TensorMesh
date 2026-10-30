@@ -48,6 +48,28 @@ def _gaussian_triangle_rule(n):
     return weights, points
 
 
+@lru_cache(maxsize=128)
+def _gaussian_tetrahedron_rule(n):
+    """Conical Gaussian product rule, exact through total degree 2*n-1.
+
+    x=u, y=(1-u)*v, z=(1-u)*(1-v)*w has Jacobian (1-u)**2*(1-v),
+    incorporated in the u and v Jacobi weights. For x**a y**b z**c,
+    the remaining polynomial has degrees a+b+c, b+c, c in u, v, w.
+    Thus n points per direction suffice. Generation and caching use CPU
+    float64; weights are positive and points strictly inside the tetrahedron.
+    """
+    wu, u = _gaussian_interval_rule(n, 2, 0)
+    wv, v = _gaussian_interval_rule(n, 1, 0)
+    ww, w = _gaussian_interval_rule(n)
+    u_grid, v_grid, w_grid = torch.meshgrid(u, v, w, indexing="ij")
+    points = torch.stack(
+        (u_grid, (1 - u_grid) * v_grid, (1 - u_grid) * (1 - v_grid) * w_grid),
+        dim=-1,
+    ).reshape(-1, 3)
+    weights = (wu[:, None, None] * wv[None, :, None] * ww[None, None, :]).reshape(-1)
+    return weights, points
+
+
 def _copy_rule(rule, dtype, device):
     # .to() alone aliases the canonical cache for CPU float64 requests.
     return tuple(t.to(dtype=dtype, device=device, copy=True) for t in rule)
@@ -178,7 +200,13 @@ def tet_quadrature(order: int = 1,
     Parameters
     ----------
     order : int, optional
-        Quadrature order between 1 and 7. Defaults to 1.
+        Requested polynomial exactness degree (>= 1). Defaults to 1.
+        Orders 1..7 retain the original tables and point ordering; see
+        Notes for their legacy exactness limitations. Higher degrees use
+        a Gauss-Jacobi/Jacobi/Legendre conical product with
+        ``ceil((order + 1) / 2)**3`` points. These generated rules have
+        positive weights and interior points, but are not symmetric or
+        minimal-point rules.
     dtype : torch.dtype, optional
         Output dtype.
     device : torch.device, optional
@@ -190,8 +218,20 @@ def tet_quadrature(order: int = 1,
         1D tensor of shape ``[n_quadrature]``.
     points : torch.Tensor
         2D tensor of shape ``[n_quadrature, 3]``.
+
+    Notes
+    -----
+    Generated rules are cached in CPU float64 and returned as independent
+    copies in the requested dtype/device. Their weights sum to 1/6.
+
+    The preserved legacy tables at orders 5, 6, 7 are exact only through
+    degrees 4, 5, 6, respectively: they fail, for example, the x**order
+    moment at their advertised degree. Request order >= 8 to use the
+    generated rules when these higher moments are needed.
     """
-    assert order >= 1 and order <= 7, f"Invalid order {order} for tet quadrature, expected one of [1,7]"
+    _positive_order(order, "tetrahedron")
+    if order > 7:
+        return _copy_rule(_gaussian_tetrahedron_rule((order + 2) // 2), dtype, device)
     weights_table = {
         1: torch.tensor([ 0.16666666666666666],dtype=dtype),
         2: torch.tensor([ 0.041666666666666664, 0.041666666666666664, 0.041666666666666664, 0.041666666666666664],dtype=dtype),
