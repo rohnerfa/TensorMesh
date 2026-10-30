@@ -66,7 +66,7 @@ with vertex, oriented-edge and cell-interior carriers. The geometry map
 always stays isoparametric with the mesh order, so sub- and
 super-parametric fields remain correct on curved elements (mind that a
 low-order geometry on a *curved* domain limits the attainable
-convergence rate of higher-order fields near the boundary). 3D spaces
+convergence rate of higher-order fields near the boundary). 3D Lagrange spaces
 whose nodes sit on faces (e.g. P3 tetrahedra) await the face-orientation
 layer and raise ``NotImplementedError``.
 
@@ -78,6 +78,13 @@ before interpolation. Geometry and ``point_data`` remain nodal Lagrange.
 BlockLayout supplies modal interpolation, trace liftings, evaluation and
 nodal output; modal point coordinates are deliberately not defined. The
 triangle quadrature supports arbitrary requested polynomial exactness degrees.
+
+Hierarchical tetrahedral fields use vertex/edge/face/cell numbering. Their
+reference tables are shared within vertex-order groups, with orientation baked
+into the edge/face functions. Matrix and load contributions use cached CSR
+projection. ``batch_size`` still chunks quadrature; ``element_batch_size`` can
+independently cap cells per group. No per-cell basis evaluation is needed during
+assembly.
 """
 import inspect
 import math
@@ -88,9 +95,13 @@ import torch.nn as nn
 
 from .projector import ReduceProjector
 from .topology import (build_edges, lagrange_boundary_mask, lagrange_dofmap,
-                       hierarchical_dofmap, hierarchical_boundary_mask)
+                       hierarchical_dofmap, hierarchical_boundary_mask,
+                       _tetrahedron_topology, hierarchical_tetrahedron_dofmap,
+                       hierarchical_tetrahedron_boundary_mask)
+from ._tetrahedron_groups import GroupedTetrahedra
 from ..nn import BufferDict
 from ..element import (
+    Tetrahedron,
     Transformation,
     element_type2dimension,
     element_type2element,
@@ -128,7 +139,7 @@ class Field:
         is scalar (value ``[]``, gradient ``[D]``); with ``c > 1`` the
         value is ``[c]`` and the gradient ``[c, D]``. Default ``1``.
     basis : str, optional
-        ``"lagrange"`` (default) or ``"hierarchical"`` (triangles only).
+        ``"lagrange"`` (default) or ``"hierarchical"`` (triangles/tetrahedra).
         Hierarchical fields always use topological coefficient numbering,
         even at the geometry order. Their coefficients are not point values.
 
@@ -551,6 +562,8 @@ class BlockLayout:
                     for element_type in self._asm.element_types}
             mask_fn = (hierarchical_boundary_mask if f.basis == "hierarchical"
                        else lagrange_boundary_mask)
+            if f.basis == "hierarchical" and self._asm.grouped_tetrahedra:
+                mask_fn = hierarchical_tetrahedron_boundary_mask
             self._boundary_cache[name] = mask_fn(
                 conn, f.order, self.n_nodes(name))
         node_sel = self._boundary_cache[name].to(self._asm._points.device)
@@ -617,8 +630,9 @@ class MixedElementAssembler(nn.Module):
 
     Notes
     -----
-    * Only the ``ReduceProjector`` scatter backend is supported (the
-      ``SparseProjector`` is float32-only, see the complex-FEM ROADMAP item).
+    * Hierarchical tetrahedral fields use orientation-grouped reference tables
+      and CSR projection for matrices and loads. Other paths retain their
+      existing reduction-based assembly.
     * ``energy`` / ``from_assembler`` are not provided for mixed forms.
     * Load vectors are assembled space-aware by :meth:`assemble_vector`
       (override :meth:`forward_vector` or pass ``func=``): same argument
@@ -654,6 +668,7 @@ class MixedElementAssembler(nn.Module):
         self.pair_projector: nn.ModuleDict = topology["pair_projector"]
         self.pair_rows: BufferDict = topology["pair_rows"]
         self.pair_cols: BufferDict = topology["pair_cols"]
+        self.grouping = topology.get("grouping")
 
         self.element_types: List[str] = list(self.elements.keys())
         self.dimension: int = element_type2dimension[self.element_types[0]]
@@ -695,6 +710,21 @@ class MixedElementAssembler(nn.Module):
     def layout(self) -> BlockLayout:
         """Block-DOF layout helpers (offsets, masks, split/cat, ...)."""
         return self._layout
+
+    @property
+    def grouped_tetrahedra(self) -> bool:
+        """Whether tetrahedral orientation groups drive field integration."""
+        return self.grouping is not None
+
+    @property
+    def cell_orientation(self):
+        """Per-type tetrahedral class IDs in original cell order."""
+        return self.grouping.orientation if self.grouped_tetrahedra else {}
+
+    @property
+    def group_cells(self):
+        """Original cell IDs for each internal integration group."""
+        return self.grouping.cells if self.grouped_tetrahedra else {}
 
     @property
     def _points(self) -> torch.Tensor:
@@ -762,13 +792,16 @@ class MixedElementAssembler(nn.Module):
             Source mesh; its element order defines the geometry order,
             independently of field orders.
         quadrature_order : int, optional
-            Triangle polynomial exactness degree. Defaults to
+            Simplex polynomial exactness degree. Defaults to
             ``2 * max(field.order)``, sufficient for constant-coefficient
-            mass/stiffness products on affine triangles. Higher-degree
+            mass/stiffness products on affine triangles/tetrahedra. Higher-degree
             coefficients, nonlinear forms and curved geometry may require
             an explicit larger value and quadrature-convergence checks.
             Other shapes retain their existing rule conventions (e.g. line/
-            tensor-product orders count points; tetrahedra have tables 1..7).
+            tensor-product orders count points).
+            Grouped tetrahedra promote requests 5, 6, and 7 to rule indices
+            6, 7, and 8: the legacy tetrahedral tables 5--7 are exact only
+            through degrees 4--6. The original tables remain unchanged.
         *args, **kwargs
             Additional arguments forwarded to ``__post_init__``.
         """
@@ -791,7 +824,7 @@ class MixedElementAssembler(nn.Module):
         mesh_order = next(iter(orders.values()))
         if quadrature_order is None:
             quadrature_order = 2 * max(f.order for f in cls.fields)
-        # Rule capability is shape-specific; triangle rules are generated
+        # Rule capability is shape-specific; simplex rules are generated
         # above degree 7, while unsupported shapes validate in their factory.
         if (isinstance(quadrature_order, bool) or not isinstance(quadrature_order, int)
                 or quadrature_order < 1):
@@ -807,14 +840,25 @@ class MixedElementAssembler(nn.Module):
         field_conn: Dict[str, torch.Tensor] = {}
         field_sign: Dict[str, torch.Tensor] = {}
         field_ref_nodes: Dict[str, torch.Tensor] = {}
+        tetra_topology = None
+        if any(f.basis == "hierarchical" for f in cls.fields) and any(
+                element_type2element(kind) is Tetrahedron for kind in elements):
+            # All entity discovery and mixed-field numbering are CPU setup.
+            # The completed module moves its registered indices to mesh.device.
+            elements = {kind: conn.detach().cpu() for kind, conn in elements.items()}
+            tetra_topology = _tetrahedron_topology(elements, n_points)
         for f in cls.fields:
             if f.basis == "hierarchical":
                 field_kind[f.trial] = "hierarchical"
-                dofmap = hierarchical_dofmap(elements, n_points, f.order)
+                if tetra_topology is None:
+                    dofmap = hierarchical_dofmap(elements, n_points, f.order)
+                    for element_type, sign in dofmap.sign.items():
+                        field_sign[f"{f.trial}__{element_type}"] = sign.to(dtype=points.dtype)
+                else:
+                    dofmap = hierarchical_tetrahedron_dofmap(
+                        elements, n_points, f.order, topology=tetra_topology)
                 conn = dofmap.conn
                 field_n_nodes[f.trial] = dofmap.n_dofs
-                for element_type, sign in dofmap.sign.items():
-                    field_sign[f"{f.trial}__{element_type}"] = sign.to(dtype=points.dtype)
             elif f.order == mesh_order:
                 field_kind[f.trial] = "nodes"
                 node_ids = torch.arange(n_points, dtype=torch.long)
@@ -855,18 +899,27 @@ class MixedElementAssembler(nn.Module):
         # no element-dependent data or signs enter these reference tables.
         reference_tables = {}
         for element_type, value in elements.items():
+            rule_order = quadrature_order
+            if tetra_topology is not None and quadrature_order in (5, 6, 7):
+                rule_order += 1
             trans = Transformation(
                 points=points,
                 elements=value,
                 element_type=element_type,
-                quadrature_order=quadrature_order,
+                quadrature_order=rule_order,
             )
             transformations[element_type] = trans
             _, q = trans.quadrature  # [n_q, D] in points.dtype
+            if tetra_topology is not None:
+                # Materialize the geometry value cache at setup as well: warm
+                # checkpoints must load into a newly constructed assembler.
+                _ = trans.shape_val
             elem_cls = element_type2element(element_type)
             geom_ref_grad[element_type] = \
                 elem_cls.get_basis_grad_fns(mesh_order, q.dtype, q.device).map(q)  # [n_q, D, nb_mesh]
             for f in cls.fields:
+                if tetra_topology is not None and f.basis == "hierarchical":
+                    continue  # GroupedTetrahedra registers one table per occupied class.
                 key = f"{f.trial}__{element_type}"
                 cache_key = (element_type, f.order, f.basis)
                 if cache_key not in reference_tables:
@@ -878,6 +931,12 @@ class MixedElementAssembler(nn.Module):
                         grad = elem_cls.get_basis_grad_fns(f.order, q.dtype, q.device).map(q)
                     reference_tables[cache_key] = val, grad
                 ref_val[key], ref_grad[key] = reference_tables[cache_key]
+
+        grouping = None
+        if tetra_topology is not None:
+            grouping = GroupedTetrahedra(
+                tetra_topology, elements, cls.fields, field_conn, transformations)
+            grouping.add_vectors(cls.fields, field_n_nodes, points.dtype)
 
         # ---- per-(test, trial) pair: edge pattern, scatter, expanded COO ---- #
         pair_projector: Dict[str, ReduceProjector] = {}
@@ -903,15 +962,18 @@ class MixedElementAssembler(nn.Module):
                            field_n_nodes[alpha.trial]),
                 )
                 num_edges = edges.shape[1]
-                for element_type in elements:
-                    n_element = elements[element_type].shape[0]
-                    nb_beta = field_conn[f"{beta.trial}__{element_type}"].shape[1]
-                    nb_alpha = field_conn[f"{alpha.trial}__{element_type}"].shape[1]
-                    pair_projector[f"{pair_key}__{element_type}"] = ReduceProjector(
-                        indices=eids[element_type],
-                        from_shape=(n_element, nb_beta, nb_alpha),
-                        to_shape=(num_edges,),
-                    )
+                if grouping is not None:
+                    grouping.add_pair(beta, alpha, eids, num_edges, points.dtype)
+                else:
+                    for element_type in elements:
+                        n_element = elements[element_type].shape[0]
+                        nb_beta = field_conn[f"{beta.trial}__{element_type}"].shape[1]
+                        nb_alpha = field_conn[f"{alpha.trial}__{element_type}"].shape[1]
+                        pair_projector[f"{pair_key}__{element_type}"] = ReduceProjector(
+                            indices=eids[element_type],
+                            from_shape=(n_element, nb_beta, nb_alpha),
+                            to_shape=(num_edges,),
+                        )
                 c_b, c_a = beta.components, alpha.components
                 arange_b = torch.arange(c_b, dtype=torch.long)
                 arange_a = torch.arange(c_a, dtype=torch.long)
@@ -938,6 +1000,7 @@ class MixedElementAssembler(nn.Module):
             "n_points": n_points,
             "field_kind": field_kind,
             "field_n_nodes": field_n_nodes,
+            "grouping": grouping,
         }
         assembler = cls(topology, *args, **kwargs)
         assembler = assembler.type(mesh.dtype).to(mesh.device)
@@ -1340,7 +1403,8 @@ class MixedElementAssembler(nn.Module):
                                               Mapping[str, torch.Tensor]]] = None,
                  scalar_data: Optional[Mapping[str, torch.Tensor]] = None,
                  batch_size: int = -1,
-                 field_data: Optional[Mapping[str, Tuple[str, torch.Tensor]]] = None
+                 field_data: Optional[Mapping[str, Tuple[str, torch.Tensor]]] = None,
+                 *, element_batch_size: Optional[int] = None
                  ) -> SparseMatrix:
         r"""Assemble the mixed bilinear form into the global block sparse matrix.
 
@@ -1349,6 +1413,12 @@ class MixedElementAssembler(nn.Module):
 
         Parameters
         ----------
+        batch_size : int, optional
+            Quadrature points per chunk; -1 or None uses the full rule.
+        element_batch_size : int, optional
+            Maximum cells per orientation-group chunk for hierarchical tetrahedra.
+            None processes the complete group. This bounds integration scratch
+            space, not the full local-matrix buffers or CSR projection metadata.
         field_data : Mapping[str, Tuple[str, torch.Tensor]], optional
             Data living on a *field's* DOFs rather than on mesh points:
             ``{"w": ("u", values)}`` with ``values`` of shape
@@ -1356,8 +1426,8 @@ class MixedElementAssembler(nn.Module):
             its ``grad``-prefixed form) becomes a ``forward`` argument,
             interpolated with that field's own basis — e.g. a previous
             Picard iterate of a generalized-order velocity field.
-            For hierarchical fields, ``values`` are global modal coefficients;
-            local orientation signs apply to value and gradient interpolation.
+            For hierarchical fields, ``values`` are global modal coefficients.
+            Triangle signs or tetrahedral oriented tables provide conformity.
 
         Returns
         -------
@@ -1367,6 +1437,8 @@ class MixedElementAssembler(nn.Module):
         """
         points, point_data, element_data, scalar_data, field_data = \
             self._normalize_inputs(points, point_data, element_data, scalar_data, field_data)
+        if element_batch_size is not None and not self.grouped_tetrahedra:
+            raise ValueError("element_batch_size is supported for grouped tetrahedral fields")
         dtype, device = points.dtype, points.device
 
         fn = self.forward if func is None else func
@@ -1375,35 +1447,41 @@ class MixedElementAssembler(nn.Module):
         zeros, eyes_by_field, needs_val, needs_grad = \
             self._pass_context(params, field_data, dtype, device)
 
-        acc: Dict[Tuple[str, str, str], Optional[torch.Tensor]] = {}
-        checked_bilinear = False
-        for element_type, jxw, tables_val, tables_grad, data_args in self._batches(
-                params, point_data, element_data, scalar_data, field_data,
-                needs_val, needs_grad, batch_size):
-            if not checked_bilinear:
-                self._check_bilinear(fn, params, data_args, dtype, device)
-                checked_bilinear = True
-            for alpha, beta in executed:
-                eyes = {"trial": eyes_by_field.get(alpha.trial),
-                        "test": eyes_by_field.get(beta.trial)}
-                out, has_e = self._run_pass(
-                    fn, params, alpha, beta,
-                    tables_val, tables_grad, data_args, zeros, eyes,
-                )
-                batch_integral = self._integrate_pair(out, jxw, has_e)  # [E, i, j, b, a]
-                key = (alpha.trial, beta.trial, element_type)
-                acc[key] = batch_integral if acc.get(key) is None else acc[key] + batch_integral
+        if self.grouped_tetrahedra:
+            pass_vals = self.grouping.integrate(
+                self, fn, params, executed, zeros, eyes_by_field,
+                point_data, element_data, scalar_data, field_data,
+                needs_val, needs_grad, batch_size, element_batch_size, matrix=True)
+        else:
+            acc: Dict[Tuple[str, str, str], Optional[torch.Tensor]] = {}
+            checked_bilinear = False
+            for element_type, jxw, tables_val, tables_grad, data_args in self._batches(
+                    params, point_data, element_data, scalar_data, field_data,
+                    needs_val, needs_grad, batch_size):
+                if not checked_bilinear:
+                    self._check_bilinear(fn, params, data_args, dtype, device)
+                    checked_bilinear = True
+                for alpha, beta in executed:
+                    eyes = {"trial": eyes_by_field.get(alpha.trial),
+                            "test": eyes_by_field.get(beta.trial)}
+                    out, has_e = self._run_pass(
+                        fn, params, alpha, beta,
+                        tables_val, tables_grad, data_args, zeros, eyes,
+                    )
+                    batch_integral = self._integrate_pair(out, jxw, has_e)
+                    key = (alpha.trial, beta.trial, element_type)
+                    acc[key] = batch_integral if acc.get(key) is None else acc[key] + batch_integral
 
-        pass_vals: Dict[Tuple[str, str], torch.Tensor] = {}
-        for alpha, beta in executed:
-            total = None
-            for element_type in self.element_types:
-                proj = self.pair_projector[f"{beta.trial}__{alpha.trial}__{element_type}"]
-                local = self._orient_contribution(
-                    acc[(alpha.trial, beta.trial, element_type)], element_type, beta, alpha)
-                projected = proj(local)  # [n_pair_edges, c_b, c_a]
-                total = projected if total is None else total + projected
-            pass_vals[(alpha.trial, beta.trial)] = total
+            pass_vals: Dict[Tuple[str, str], torch.Tensor] = {}
+            for alpha, beta in executed:
+                total = None
+                for element_type in self.element_types:
+                    proj = self.pair_projector[f"{beta.trial}__{alpha.trial}__{element_type}"]
+                    local = self._orient_contribution(
+                        acc[(alpha.trial, beta.trial, element_type)], element_type, beta, alpha)
+                    projected = proj(local)
+                    total = projected if total is None else total + projected
+                pass_vals[(alpha.trial, beta.trial)] = total
 
         vals = []
         pattern = []
@@ -1447,7 +1525,8 @@ class MixedElementAssembler(nn.Module):
                                                      Mapping[str, torch.Tensor]]] = None,
                         scalar_data: Optional[Mapping[str, torch.Tensor]] = None,
                         batch_size: int = -1,
-                        field_data: Optional[Mapping[str, Tuple[str, torch.Tensor]]] = None
+                        field_data: Optional[Mapping[str, Tuple[str, torch.Tensor]]] = None,
+                        *, element_batch_size: Optional[int] = None
                         ) -> torch.Tensor:
         r"""Assemble a **linear** form into the global block load vector.
 
@@ -1466,6 +1545,10 @@ class MixedElementAssembler(nn.Module):
         recipe). ``field_data`` is supported — e.g. the previous time
         step of a velocity living on its own field DOFs.
 
+        ``batch_size`` chunks quadrature points. For grouped tetrahedral fields,
+        ``element_batch_size`` independently limits cells per group chunk, with
+        None processing the full group, as in ``assembler(...)``.
+
         Returns
         -------
         torch.Tensor
@@ -1474,6 +1557,8 @@ class MixedElementAssembler(nn.Module):
         """
         points, point_data, element_data, scalar_data, field_data = \
             self._normalize_inputs(points, point_data, element_data, scalar_data, field_data)
+        if element_batch_size is not None and not self.grouped_tetrahedra:
+            raise ValueError("element_batch_size is supported for grouped tetrahedral fields")
         dtype, device = points.dtype, points.device
 
         fn = self.forward_vector if func is None else func
@@ -1493,6 +1578,17 @@ class MixedElementAssembler(nn.Module):
             )
         zeros, eyes_by_field, needs_val, needs_grad = \
             self._pass_context(params, field_data, dtype, device)
+
+        if self.grouped_tetrahedra:
+            projected = self.grouping.integrate(
+                self, fn, params, [(None, beta) for beta in executed], zeros, eyes_by_field,
+                point_data, element_data, scalar_data, field_data,
+                needs_val, needs_grad, batch_size, element_batch_size, matrix=False)
+            return torch.cat([
+                projected[f.trial].reshape(-1) if f.trial in projected else
+                points.new_zeros(self.field_n_nodes[f.trial] * f.components)
+                for f in self.fields
+            ])
 
         acc: Dict[Tuple[str, str], Optional[torch.Tensor]] = {}
         checked_linear = False

@@ -295,8 +295,9 @@ mesh-order basis, ``grad{key}`` available), ``element_data``,
       w = layout.split(sol)["u"]                    # [n_u, c] on the P2 DOFs
       K = assembler(field_data={"w": ("u", w)})
 
-   On a mesh whose order equals the field order the two channels agree —
-   ``point_data`` is then the simpler spelling.
+   For a Lagrange field whose order equals the mesh order, the two channels
+   agree. Hierarchical field data always contains modal coefficients, including
+   at the geometry order; use ``field_data`` for those coefficients.
 
 
 .. _mixed-generalized-pairs:
@@ -323,16 +324,69 @@ unique (oriented) edge, plus cell interiors. In practice this means:
   paired with a P1 pressure; sub- and super-parametric fields are both
   correct.
 
-Current limits, checked with explicit errors: in 3D the topological map
-covers vertex + edge DOFs (tetra P2 works; orders needing face DOFs
-raise ``NotImplementedError``), and the quadrature tables stop at
-degree 7 — about P3-P2 in practice.
+For generalized **Lagrange** fields, the 3D topological map covers vertex + edge
+DOFs (tetra P2 works; orders needing face DOFs raise ``NotImplementedError``).
+Hierarchical tetrahedral fields additionally support shared face and private
+cell modes, independently of geometry degree. Generated simplex rules extend
+high-order quadrature; see :doc:`elements_and_quadrature` for legacy-rule details.
 
-For fields with topological DOFs, ``layout.node_ids`` (a mesh-node
+For Lagrange fields with topological DOFs, ``layout.node_ids`` (a mesh-node
 concept) is unavailable; use ``layout.points(name)``,
 ``layout.boundary_mask(name)`` and ``layout.dof_mask(name, where=...)``,
-which work for every field kind, and move data with
+which work for nodal fields, and move data with
 ``layout.prolong`` / ``layout.restrict`` (isoparametric interpolation).
+
+
+Grouped hierarchical tetrahedra
+----------------------------------------
+
+Select ``Field(..., basis="hierarchical")`` on a tetrahedral mesh to use
+canonical vertex-ID-oriented edge and face functions. All fields share one
+topological partition into at most 24 orientation classes. Each occupied class
+uses shared reference values ``[Q,B]`` and gradients ``[Q,3,B]``; geometry stays
+nodal. Lagrange fields in the same mixed system share the group schedule while
+reusing their orientation-independent reference tables.
+
+The same weak-form interface applies. ``batch_size`` counts quadrature points;
+the optional ``element_batch_size`` independently limits cells in a group:
+
+.. code-block:: python
+
+   class Poisson3D(MixedElementAssembler):
+       fields = [Field("u", "v", order=4, basis="hierarchical")]
+
+       def forward(self, gradu, gradv):
+           return (gradu * gradv).sum()
+
+       def forward_vector(self, v, x):
+           return (1 + x[0]) * v
+
+   mesh = Mesh.gen_cube(chara_length=0.5, order=1).double()
+   assembler = Poisson3D.from_mesh(mesh)
+   K = assembler(batch_size=16, element_batch_size=128)
+   b = assembler.assemble_vector(batch_size=16, element_batch_size=128)
+   boundary = assembler.layout.boundary_mask("u")
+
+With ``element_batch_size=None``, every cell in the current group is integrated
+together. This parameter is available on the grouped tetrahedral path. It does
+not change public cell ordering: ``element_data`` stays in original mesh order.
+
+Completed local blocks occupy disjoint slices of a group-ordered source buffer.
+One precomputed CSR projection per test/trial block combines them into sparse
+global values; loads use the analogous coefficient projection. This path does
+not call the older indexed matrix/load accumulation routines. Source buffers and
+CSR metadata still scale with all local basis pairs; chunking bounds integration
+scratch memory, not total assembly memory. GPU speedups depend on degree, group
+sizes, hardware, and form, and must be measured.
+
+The tetrahedral legacy rule indices 5--7 have verified exactness 4--6. To meet an
+explicit/default exactness request, grouped assembly selects rule indices 6, 7,
+and 8 for requested degrees 5, 6, and 7, respectively. Other existing assembly
+paths retain their rule-selection behavior.
+
+See :doc:`hierarchical_tetrahedra` for the basis, numbering, and orientation
+contract. Modal coefficients have no interpolation-point coordinates;
+``layout.points`` and coordinate-predicate ``dof_mask`` are nodal-only APIs.
 
 
 Worked examples
