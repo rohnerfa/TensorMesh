@@ -7,6 +7,113 @@ numerical checks, separated setup/integration/projection timings, and CUDA
 allocator peaks when CUDA is selected. CPU runs provide numerical and harness
 validation; they do not establish CUDA performance acceptance.
 
+High-order comparison against upstream
+--------------------------------------
+
+Use ``examples/poisson/benchmark_upstream_tetrahedra.py`` to answer how much
+assembly time changes when switching from upstream Lagrange to hierarchical
+tetrahedra at P3/P4/P6. This is a separate, process-isolated comparison against
+``camlab-ethz/TensorMesh`` commit
+``2d544e8bc7ee8de412ffbc768b313875c3b12895``. The baseline calls upstream's
+``ElementAssembler`` and ``NodeAssembler`` with their default reduce projector;
+the feature calls grouped ``MixedElementAssembler`` with CSR projection.
+
+Prepare the baseline once (no second package installation is needed):
+
+.. code-block:: bash
+
+   git clone https://github.com/camlab-ethz/TensorMesh.git ../TensorMesh-upstream
+   git -C ../TensorMesh-upstream checkout --detach 2d544e8bc7ee8de412ffbc768b313875c3b12895
+
+From the feature checkout, using the same activated environment:
+
+.. code-block:: bash
+
+   mkdir -p dist
+   python examples/poisson/benchmark_upstream_tetrahedra.py \
+       --upstream ../TensorMesh-upstream --device cuda --dtype float64 \
+       --degrees 3 4 6 --forms mass poisson --subdivisions 2 4 \
+       --batch-size -1 --repeats 7 --warmup 2 \
+       --output dist/tetra-upstream-gpu.json \
+       > dist/tetra-upstream-gpu.stdout.json
+
+   python examples/poisson/benchmark_upstream_tetrahedra.py \
+       --inspect dist/tetra-upstream-gpu.json
+
+For a CPU check, use ``--device cpu --subdivisions 1 --repeats 1 --warmup 1``. The integration
+test additionally accepts ``TENSORMESH_UPSTREAM=/absolute/path/to/TensorMesh-upstream``;
+without this environment variable the real-upstream tests skip.
+
+The printed table shows upstream and hierarchical matrix milliseconds, the ratio
+``L/H`` (above one favors hierarchical), and ``H change``: the percentage increase
+or decrease in time after switching. JSON also includes unit-load timing ratios,
+raw samples, first calls, setup, and memory. Each pair must pass numerical checks
+before ratios are emitted. An OOM or failed check has an explicit status instead
+of a speedup. P6 with 384 cells can exceed an 11 GB GPU's capacity on the upstream
+unchunked path; the 48-cell comparison is still reported. Use the same smaller
+``--batch-size`` on both paths for a separately labeled chunked experiment.
+
+Matched inputs and explicit adapters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Both workers receive the same binary mesh and quadrature arrays. The mesh has
+matching degree-p geometry and fields, with all nodal points at affine positions:
+faces are straight. Integer barycentric coordinates produce the internal
+TensorMesh ordering and exactly shared edge/face nodes. The default balanced
+orientation distribution occupies all 24 classes at 48 cells. ``single`` is
+available as a diagnostic distribution. No Gmsh generation is required.
+
+Two benchmark-only runtime adapters are applied identically to both checkouts:
+
+* Supply a positive conical Gauss-Jacobi rule with ``(p+1)**3`` points, exact
+  through degree ``2*p+1``. This avoids legacy-rule underintegration and supplies
+  high-order rules absent upstream. Both mass and stiffness use this same rule.
+* Fix the integer side length in ``tet_linspace``. Upstream uses
+  ``floor(number_of_points**(1/3))``, which rounds down for some perfect cubes
+  and breaks P5/P6 interior-node generation. The adapter uses ``order+1`` or
+  ``order-1``; node placement, nodal polynomial construction and evaluators
+  otherwise remain upstream code.
+
+These adapters are recorded in every worker result. Thus this is an
+**equally integrated upstream assembly comparison with explicit input fixes**.
+The difference includes the implementations' geometry caching, dispatch and
+projection costs as well as the basis change. It measures the cost of switching
+assembly paths, rather than isolating basis arithmetic alone. Upstream source
+files are not edited. The default pin requires a clean checkout; an explicit
+``--upstream-commit`` can select another audited revision.
+
+Verification and isolation
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For every degree/form pair, separate workers first assemble on a 48-cell,
+24-orientation verification mesh. A sparse evaluation matrix ``T`` maps modal
+coefficients to nodal values. Shared traces are checked, followed by full sparse
+matrix and load comparisons ``A_H = T.T @ A_L @ T`` and ``b_H = T.T @ b_L``.
+Each timed size additionally checks constant, linear, degree-p and mixed
+monomial bilinear forms and loads against analytic unit-cube integrals, nodal
+Kronecker interpolation, and symmetry. Failed checks suppress timing ratios;
+this also detects insufficient nodal accuracy at higher degree or float32.
+The default float64 tolerance is ``2e-8`` in maximum absolute error scaled by
+``max(1, max(abs(reference)))``. Float32 uses ``3e-4`` and may fail at high degree.
+
+Each implementation/size/form runs in a fresh interpreter, sequentially on the
+same requested device. Workers verify all imported TensorMesh modules belong to
+their selected checkout. Reports record commits, source hashes, import paths,
+mesh/rule hashes, device, software and batching settings. Source changes during
+the run are rejected. Worker jobs, logs, input arrays and validation operators
+are retained in a uniquely named directory beside the report.
+
+Setup and first calls are separated from warmed synchronized wall-clock samples.
+Autograd is disabled. ``--batch-size -1`` uses the full rule on both paths, with
+no explicit cell chunks. Hierarchical orientation groups still implicitly batch
+cells; upstream integrates the entire mesh. Upstream's geometry caches are
+retained during warmed calls. Both matrix and load assemblers remain resident.
+GPU outputs are released before timing samples; CPU copies of the first outputs
+are retained for later checks. Diagnostic basis tabulation runs after timing so
+it cannot prewarm production caches or inflate GPU allocation measurements.
+Peak allocated GPU memory includes resident tensors and production caches. Each
+case starts in a fresh process, and the report is checkpointed after each worker.
+
 Running the benchmark
 ---------------------
 
@@ -84,7 +191,8 @@ rule 8 because legacy tables 5--7 underintegrate by one degree. The report
 records requested exactness, assembler request, actual rule index, point count
 and a hash of the actual points and weights.
 
-``--compare-lagrange`` uses the same cube geometry and actual quadrature rule.
+The original ``benchmark_hierarchical_tetrahedra.py --compare-lagrange`` uses
+the same linear cube geometry and actual quadrature rule within the feature checkout.
 The Lagrange assembler request is adjusted explicitly to bypass its legacy
 non-promoting dispatch. Comparisons are limited to degrees 1 and 2, for which
 generalized tetrahedral Lagrange topology is supported. Higher degrees receive
@@ -93,6 +201,9 @@ element batching; its report records ``element_batch_size: null``. Its matrix
 and load timings include its own projection backend. Modal and nodal matrix
 entries are not directly compared: the analytic physical identities are the
 common checks. No speedup is extrapolated to unsupported degrees or hardware.
+This limit concerns constructing new field connectivity on a linear mesh;
+upstream matching-order nodal meshes support higher-order fields, as used by
+the separate upstream comparison above.
 
 Timing and memory interpretation
 --------------------------------
