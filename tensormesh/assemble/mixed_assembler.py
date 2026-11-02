@@ -810,9 +810,6 @@ class MixedElementAssembler(nn.Module):
             an explicit larger value and quadrature-convergence checks.
             Other shapes retain their existing rule conventions (e.g. line/
             tensor-product orders count points).
-            Grouped tetrahedra promote requests 5, 6, and 7 to rule indices
-            6, 7, and 8: the legacy tetrahedral tables 5--7 are exact only
-            through degrees 4--6. The original tables remain unchanged.
         *args, **kwargs
             Additional arguments forwarded to ``__post_init__``.
         """
@@ -910,14 +907,11 @@ class MixedElementAssembler(nn.Module):
         # no element-dependent data or signs enter these reference tables.
         reference_tables = {}
         for element_type, value in elements.items():
-            rule_order = quadrature_order
-            if tetra_topology is not None and quadrature_order in (5, 6, 7):
-                rule_order += 1
             trans = Transformation(
                 points=points,
                 elements=value,
                 element_type=element_type,
-                quadrature_order=rule_order,
+                quadrature_order=quadrature_order,
             )
             transformations[element_type] = trans
             _, q = trans.quadrature  # [n_q, D] in points.dtype

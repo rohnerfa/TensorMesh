@@ -20,12 +20,12 @@ def _moment(a, b=0, c=0):
 @pytest.mark.parametrize("p", [3, 4, 5, 6])
 def test_default_rule_integrates_degree_p_polynomial_mass_stiffness_and_load(p):
     # Class 17 makes physical x differ from the first reference coordinate.
-    # P3 specifically audits the grouped promotion of defective legacy rules.
+    # P3 specifically audits the corrected degree-six tabulated rule.
     mesh = orientation_mesh([17])
     asm = poisson(p).from_mesh(mesh)
     refined = poisson(p).from_mesh(mesh, quadrature_order=2 * p + 4)
+    assert asm.transformation["tetra"].quadrature_order == 2 * p
     if p >= 4:
-        assert asm.transformation["tetra"].quadrature_order == 2 * p
         assert asm.transformation["tetra"].n_quadrature == (p + 1) ** 3
     mass = asm(func=lambda u, v: u * v, batch_size=37).to_dense()
     stiffness = asm(batch_size=37).to_dense()
@@ -77,18 +77,41 @@ def test_minimal_affine_stiffness_degree_and_uneven_quadrature_chunks(p):
                                atol=4e-13, rtol=4e-11)
 
 
-def test_requested_degree_seven_exactness_despite_legacy_table_defect():
+def test_requested_degree_seven_exactness():
     mesh = patch_mesh()
     requested = poisson(3).from_mesh(mesh, quadrature_order=7)
     refined = poisson(3).from_mesh(mesh, quadrature_order=12)
-    # P3 * P3 * x is degree seven. The legacy rule numbered 7 is only
-    # degree-six exact, so the grouped path must select a sufficient rule.
+    # P3 * P3 * x is degree seven; use the public degree-seven rule directly.
+    assert requested.transformation["tetra"].quadrature_order == 7
+    assert requested.transformation["tetra"].n_quadrature == 64
     form = lambda u, v, x: (1 + x[0]) * u * v
     load = lambda v, x: x[0] ** 4 * v
     torch.testing.assert_close(requested(func=form).to_dense(), refined(func=form).to_dense(),
                                atol=3e-14, rtol=4e-11)
     torch.testing.assert_close(requested.assemble_vector(func=load),
                                refined.assemble_vector(func=load), atol=3e-14, rtol=4e-11)
+
+
+@pytest.mark.parametrize("family", ["lagrange", "hierarchical"])
+@pytest.mark.parametrize("degree", [5, 6, 7])
+def test_corrected_rules_integrate_weighted_p2_fields(family, degree):
+    class WeightedMass(MixedElementAssembler):
+        fields = [Field("u", "v", 2, basis=family)]
+
+        def forward(self, u, v, x):
+            return x[0] ** (degree - 4) * u * v
+
+        def forward_vector(self, v, x):
+            return x[0] ** (degree - 2) * v
+
+    mesh = patch_mesh()
+    requested = WeightedMass.from_mesh(mesh, quadrature_order=degree)
+    refined = WeightedMass.from_mesh(mesh, quadrature_order=12)
+    assert requested.transformation["tetra"].quadrature_order == degree
+    torch.testing.assert_close(requested().to_dense(), refined().to_dense(),
+                               atol=3e-14, rtol=4e-11)
+    torch.testing.assert_close(requested.assemble_vector(), refined.assemble_vector(),
+                               atol=3e-14, rtol=4e-11)
 
 
 @pytest.mark.parametrize("p", [4, 5, 6])
