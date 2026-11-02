@@ -316,7 +316,7 @@ def reconstruct(asm, matrix=True, batch_size=16, element_batch_size=None, field_
         seconds["geometry_data_and_physical_gradients"] += elapsed
         if batch is None:
             break
-        group, start, stop, last_q, jxw, val, grad, data = batch
+        kind, start, stop, last_q, jxw, val, grad, data = batch
         if not checked:
             _, elapsed = timed_call(lambda: asm._check_bilinear(
                 fn, params, data, asm.dtype, asm.device,
@@ -346,7 +346,7 @@ def reconstruct(asm, matrix=True, batch_size=16, element_batch_size=None, field_
                 if key not in sources:
                     sources[key] = local.new_empty(projectors[key].from_shape[0], *trailing)
                 width = local.numel() // ((stop - start) * np.prod(trailing))
-                offset = slices[key][group.key][0]
+                offset = slices[key][kind][0]
                 sources[key][offset + start * width:offset + stop * width] = \
                     local.reshape(-1, *trailing)
 
@@ -446,16 +446,25 @@ def storage_report(asm, batch_size, element_batch_size):
                        for beta in asm.fields for alpha in asm.fields)
     connectivity_bytes = sum(tensor.numel() * tensor.element_size()
                              for buffers in (grouping.cells, grouping.elements,
-                                             grouping.field_conn, grouping.orientation)
+                                              grouping.field_conn, grouping.orientation,
+                                              grouping.table_index)
                              for tensor in buffers.values())
     largest_gradients = 0
-    for group in grouping.groups:
-        cells = min(group.n_cells, element_batch_size or group.n_cells)
-        nq = asm.transformation[group.element_type].n_quadrature
+    largest_reference_gather = 0
+    cell_batches = {}
+    for kind in grouping.element_types:
+        n_cells = len(grouping.elements[kind])
+        cells = min(n_cells, element_batch_size or n_cells)
+        cell_batches[kind] = (n_cells + cells - 1) // cells
+        nq = asm.transformation[kind].n_quadrature
         nq = nq if batch_size in (-1, None) else min(nq, batch_size)
-        width = sum(grouping.field_conn[f"{f.trial}__{group.key}"].shape[1]
+        width = sum(grouping.field_conn[f"{f.trial}__{kind}"].shape[1]
                     for f in asm.fields)
         largest_gradients = max(largest_gradients, 3 * cells * nq * width * size)
+        modal_width = sum(grouping.field_conn[f"{f.trial}__{kind}"].shape[1]
+                          for f in asm.fields if f.basis == "hierarchical")
+        largest_reference_gather = max(largest_reference_gather,
+                                       4 * cells * nq * modal_width * size)
     return {"oriented_reference_storage_bytes": sum(storage.values()),
             "all_declared_matrix_and_load_csr_bytes": csr_bytes,
             "all_declared_local_matrix_source_bytes": local_bytes,
@@ -464,8 +473,10 @@ def storage_report(asm, batch_size, element_batch_size):
             "global_load_vector_bytes": asm.n_dofs * size,
             "grouped_connectivity_and_orientation_bytes": connectivity_bytes,
             "physical_gradient_scratch_upper_estimate_bytes": largest_gradients,
-            "reference_tables_have_no_element_axis": all(t.ndim == 2 for t in grouping.ref_val.values())
-            and all(t.ndim == 3 for t in grouping.ref_grad.values())}
+            "reference_gather_scratch_upper_estimate_bytes": largest_reference_gather,
+            "cell_batches_per_quadrature_sweep": cell_batches,
+            "reference_tables_have_no_element_axis": all(t.ndim == 3 for t in grouping.ref_val.values())
+            and all(t.ndim == 4 for t in grouping.ref_grad.values())}
 
 
 def optional_solve(asm, matrix, load, device, repeats, warmup):
@@ -574,6 +585,8 @@ def benchmark_case(mesh, p, form, family, device, repeats, warmup, batch_size,
             "device": str(device), "dtype": str(asm.dtype).removeprefix("torch."),
             "n_dofs": asm.n_dofs, "fields": [vars(f) for f in asm.fields],
             "batch_size": batch_size, "element_batch_size": chunks.get("element_batch_size"),
+            "cell_batching": ("original_order_across_orientations" if asm.grouped_tetrahedra
+                              else "all_cells_per_element_type"),
             "quadrature": quadrature, "orientation_group_histogram": histogram,
             "executed_blocks": [f"{b.trial}__{a.trial}"
                                 for a, b in asm._executed_pairs(asm.fields, params)],
@@ -694,7 +707,8 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=16, help="quadrature points; -1 = all")
-    parser.add_argument("--element-batch-size", type=int, default=32, help="cells; 0 = full group")
+    parser.add_argument("--element-batch-size", type=int, default=32,
+                        help="cells across orientations; 0 = all cells of each element type")
     parser.add_argument("--quadrature-order", type=int)
     parser.add_argument("--quadrature-extra", type=int, default=0)
     parser.add_argument("--compare-lagrange", action="store_true")

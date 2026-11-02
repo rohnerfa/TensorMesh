@@ -84,6 +84,9 @@ def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys,
                                      "--upstream-assembler", upstream_assembler])
     assert report["upstream"]["commit"] == PINNED_UPSTREAM
     assert report["protocol"]["upstream_assembler"] == upstream_assembler
+    assert report["protocol"]["hierarchical_element_batch_size"] is None
+    assert report["protocol"]["hierarchical_cell_batching"] == "original_order_across_orientations"
+    assert report["wall_seconds"] > 0
     assert report["status"] == "completed"
     assert len(report["validation"]) == len(report["comparisons"]) == 6
     assert not report["gpu_performance_measured"]
@@ -95,6 +98,8 @@ def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys,
         assert check["load_change_of_basis_error"] < 2e-8
     for case in report["cases"]:
         assert case["numerical"]["passed"]
+        assert case["element_batch_size"] is None
+        assert case["worker_wall_seconds"] > 0
         if case["family"] == "lagrange":
             assert case["assembly_api"].startswith(expected)
         root = Path(case["source"]["root"]) / "tensormesh"
@@ -105,6 +110,8 @@ def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys,
     printed = capsys.readouterr().out
     assert "H change" in printed
     assert f"L: upstream {expected}" in printed
+    assert "Cell chunks: L all cells; H all cells, spanning orientations" in printed
+    assert "median of 1 warmed matrix calls" in printed
     assert all(c["upstream_assembler"] == upstream_assembler for c in report["comparisons"])
     pair = {c["family"]: c for c in report["cases"] if not c["validation"]
             and c["p"] == 3 and c["form"] == "mass"}
@@ -118,13 +125,30 @@ def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys,
 @pytest.mark.parametrize("upstream_assembler", ["element", "mixed"])
 def test_real_upstream_p5_chunked_quadrature_and_single_orientation(tmp_path, upstream_assembler):
     report = run_isolated(tmp_path, ["--degrees", "5", "--forms", "poisson", "--batch-size", "17",
+                                     "--element-batch-size", "5",
                                      "--orientations", "balanced", "single",
                                      "--upstream-assembler", upstream_assembler])
     assert report["validation"][0]["passed"]
     assert len(report["comparisons"]) == 2
     for case in report["cases"]:
         assert case["batch_size"] == 17
+        assert case["element_batch_size"] == (5 if case["family"] == "hierarchical" else None)
         assert case["numerical"]["passed"]
+
+
+def test_known_p6_oom_case_is_skipped_without_starting_any_workers(tmp_path, capsys):
+    report = run_isolated(tmp_path, ["--degrees", "6", "--forms", "poisson", "--subdivisions", "4"])
+    assert report["status"] == "completed"
+    assert report["cases"] == report["validation"] == []
+    assert len(report["comparisons"]) == 1
+    assert report["comparisons"][0]["status"] == "skipped"
+    assert "operations" not in report["comparisons"][0]
+    assert not list(Path(report["artifacts"]).iterdir())
+    assert not report["gpu_performance_measured"]
+    inspect_reports([tmp_path / "comparison.json"])
+    printed = capsys.readouterr().out
+    assert "P6 n=4 poisson balanced: skipped" in printed
+    assert "0 isolated workers" in printed
 
 
 def test_real_upstream_inaccurate_float32_p6_suppresses_ratios(tmp_path):

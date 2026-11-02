@@ -83,8 +83,8 @@ Hierarchical tetrahedral fields use vertex/edge/face/cell numbering. Their
 reference tables are shared within vertex-order groups, with orientation baked
 into the edge/face functions. Matrix and load contributions use cached CSR
 projection. ``batch_size`` still chunks quadrature; ``element_batch_size`` can
-independently cap cells per group. No per-cell basis evaluation is needed during
-assembly.
+independently cap original-order cells across all orientations. No per-cell
+basis evaluation is needed during assembly.
 """
 import inspect
 import math
@@ -637,9 +637,9 @@ class MixedElementAssembler(nn.Module):
 
     Notes
     -----
-    * Hierarchical tetrahedral fields use orientation-grouped reference tables
-      and CSR projection for matrices and loads. Other paths retain their
-      existing reduction-based assembly.
+    * Hierarchical tetrahedral fields use shared orientation table banks,
+      cell chunks spanning orientations, and CSR projection for matrices and loads.
+      Other paths retain their existing reduction-based assembly.
     * ``energy`` / ``from_assembler`` are not provided for mixed forms.
     * Load vectors are assembled space-aware by :meth:`assemble_vector`
       (override :meth:`forward_vector` or pass ``func=``): same argument
@@ -720,7 +720,7 @@ class MixedElementAssembler(nn.Module):
 
     @property
     def grouped_tetrahedra(self) -> bool:
-        """Whether tetrahedral orientation groups drive field integration."""
+        """Whether tetrahedral orientation table banks are used for integration."""
         return self.grouping is not None
 
     @property
@@ -730,7 +730,7 @@ class MixedElementAssembler(nn.Module):
 
     @property
     def group_cells(self):
-        """Original cell IDs for each internal integration group."""
+        """Original cell IDs for each reference-table orientation class."""
         return self.grouping.cells if self.grouped_tetrahedra else {}
 
     @property
@@ -1130,7 +1130,7 @@ class MixedElementAssembler(nn.Module):
 
         def add_field_arg(side, kind, f, table, basis_ax, comp_ax):
             grad = kind.endswith("grad")
-            if grad:
+            if grad or table.ndim == 3:  # physical gradients or per-cell values
                 k = add_raw(table, {AX_E: 0, AX_Q: 0, basis_ax: 0})
             else:
                 k = add_raw(table, {AX_Q: 0, basis_ax: 0})
@@ -1423,8 +1423,9 @@ class MixedElementAssembler(nn.Module):
         batch_size : int, optional
             Quadrature points per chunk; -1 or None uses the full rule.
         element_batch_size : int, optional
-            Maximum cells per orientation-group chunk for hierarchical tetrahedra.
-            None processes the complete group. This bounds integration scratch
+            Maximum cells per element-type chunk for hierarchical tetrahedra,
+            in original mesh order across orientations. None processes all cells
+            of that element type together. This bounds integration scratch
             space, not the full local-matrix buffers or CSR projection metadata.
         field_data : Mapping[str, Tuple[str, torch.Tensor]], optional
             Data living on a *field's* DOFs rather than on mesh points:
@@ -1553,8 +1554,9 @@ class MixedElementAssembler(nn.Module):
         step of a velocity living on its own field DOFs.
 
         ``batch_size`` chunks quadrature points. For grouped tetrahedral fields,
-        ``element_batch_size`` independently limits cells per group chunk, with
-        None processing the full group, as in ``assembler(...)``.
+        ``element_batch_size`` independently limits original-order cells across
+        orientations, with None processing all cells of each element type,
+        as in ``assembler(...)``.
 
         Returns
         -------

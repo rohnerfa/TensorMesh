@@ -43,7 +43,7 @@ def test_stage_reconstruction_matches_chunked_public_assembly_and_analytic_cube(
     mesh = cube_mesh(1)
     asm = assembler_class(2, form).from_mesh(mesh)
     field_data = data_for(asm, form, 0.5)
-    kwargs = {"field_data": field_data, "batch_size": 3, "element_batch_size": 1}
+    kwargs = {"field_data": field_data, "batch_size": 3, "element_batch_size": 4}
     with torch.no_grad():
         matrix = asm(**kwargs)
         load = asm.assemble_vector(**kwargs)
@@ -85,6 +85,8 @@ def test_report_has_analytic_checks_reassembly_and_same_rule_lagrange_comparison
         assert modal["reconstruction"]["matrix_and_load_match_public_assembly"]
         assert sum(modal["orientation_group_histogram"].values()) == 6
         assert modal["storage"]["reference_tables_have_no_element_axis"]
+        assert modal["cell_batching"] == "original_order_across_orientations"
+        assert modal["storage"]["cell_batches_per_quadrature_sweep"] == {"tetra": 6}
         assert "oriented_reference_tabulation" in modal["setup"]["exclusive_cpu_stages_seconds"]
         for case in (modal, nodal):
             assert case["numerical"]["passed"]

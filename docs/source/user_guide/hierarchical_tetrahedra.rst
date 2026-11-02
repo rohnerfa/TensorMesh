@@ -225,8 +225,8 @@ coefficient with one does not represent a constant field.
 ``MixedElementAssembler`` selects the correct class table for every occupied
 orientation and uses unsigned coefficients. The same topology and reference
 tables are reused across fields of matching degree. Matrix and load assembly
-use CSR projection of group-ordered local contributions; public connectivity
-and cell data retain the original mesh ordering.
+use CSR projection of original-cell-order local contributions. Cell chunks span
+orientations; neither connectivity nor cell data is reordered by orientation.
 
 Numerical coverage
 ------------------

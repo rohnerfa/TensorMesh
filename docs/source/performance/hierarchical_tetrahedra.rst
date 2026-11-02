@@ -36,7 +36,7 @@ From the feature checkout, using the same activated environment:
    python examples/poisson/benchmark_upstream_tetrahedra.py \
        --upstream ../TensorMesh-upstream --device cuda --dtype float64 \
        --degrees 3 4 6 --forms mass poisson --subdivisions 2 4 \
-       --batch-size -1 --repeats 7 --warmup 2 \
+       --batch-size -1 --element-batch-size 0 --repeats 7 --warmup 2 \
        --output dist/tetra-upstream-gpu.json \
        > dist/tetra-upstream-gpu.stdout.json
 
@@ -52,9 +52,13 @@ The printed table shows upstream and hierarchical matrix milliseconds, the ratio
 or decrease in time after switching. JSON also includes unit-load timing ratios,
 raw samples, first calls, setup, and memory. Each pair must pass numerical checks
 before ratios are emitted. An OOM or failed check has an explicit status instead
-of a speedup. P6 with 384 cells can exceed an 11 GB GPU's capacity on the upstream
-unchunked path; the 48-cell comparison is still reported. Use the same smaller
-``--batch-size`` on both paths for a separately labeled chunked experiment.
+of a speedup. **P6 Poisson at 384 cells is skipped by default**, before mesh
+construction or worker launch, because the previous Euler run exhausted GPU
+memory. P6 mass and the 48-cell P6 Poisson comparison remain in the sweep.
+Additional exclusions can be appended with ``--skip-case P FORM SUBDIVISIONS``.
+Skipped cases are printed and recorded without timing ratios and do not mark
+the report as failed. Use the same smaller ``--batch-size`` on both paths for
+a separately labeled quadrature-chunked experiment.
 
 Mixed-assembler comparison
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -67,12 +71,12 @@ To compare through ``MixedElementAssembler`` on both checkouts, run:
        --upstream ../TensorMesh-upstream --upstream-assembler mixed \
        --device cuda --dtype float64 --degrees 3 4 6 \
        --forms mass poisson --subdivisions 2 4 \
-       --batch-size -1 --repeats 7 --warmup 2 \
-       --output dist/tetra-upstream-mixed-gpu.json \
-       > dist/tetra-upstream-mixed-gpu.stdout.json
+       --batch-size -1 --element-batch-size 0 --repeats 7 --warmup 2 \
+       --output dist/tetra-upstream-cell-batched-gpu.json \
+       > dist/tetra-upstream-cell-batched-gpu.stdout.json
 
    python examples/poisson/benchmark_upstream_tetrahedra.py \
-       --inspect dist/tetra-upstream-mixed-gpu.json
+       --inspect dist/tetra-upstream-cell-batched-gpu.json
 
 This uses the same scalar mass/Poisson forms and a single degree-p field on each
 side. Upstream declares ``Field("u", "v", p)``; the feature selects the
@@ -82,10 +86,20 @@ lattice adapters and full operator-equivalence checks apply to either baseline.
 
 Both mixed paths recompute geometry and physical field gradients on each call.
 This removes the original comparison's ``ElementAssembler`` versus
-``MixedElementAssembler`` execution/caching difference. Orientation-group
-scheduling, local-buffer packing, and CSR versus reduction projection still
-differ. This measures the hierarchical extension to mixed assembly, including
-those implementation choices. It does not introduce new coupled Stokes forms.
+``MixedElementAssembler`` execution/caching difference. Both paths now process
+all cells of an element type together by default; hierarchical orientation
+classes no longer imply separate integration passes. Oriented table selection,
+local-buffer packing, and CSR versus reduction projection still differ. This
+measures the hierarchical extension to mixed assembly, including those
+implementation choices. It does not introduce new coupled Stokes forms.
+
+``--element-batch-size N`` limits hierarchical cells per chunk across orientations;
+``0`` (the default) means all cells. The pinned upstream APIs do not support this
+cell limit, so upstream always uses all cells and the report explicitly labels
+the hierarchical-only limit. For matched cell scheduling use ``0``; for matched
+quadrature chunking use the same ``--batch-size`` supplied to both paths. Unlike
+the earlier orientation-group schedule, unchunked high-order mass assembly can
+materialize cell-dependent integrands and consume more GPU scratch memory.
 
 Pass several explicit report filenames to ``--inspect`` to display both
 baseline comparisons; each table identifies its upstream assembler.
@@ -141,9 +155,9 @@ the run are rejected. Worker jobs, logs, input arrays and validation operators
 are retained in a uniquely named directory beside the report.
 
 Setup and first calls are separated from warmed synchronized wall-clock samples.
-Autograd is disabled. ``--batch-size -1`` uses the full rule on both paths, with
-no explicit cell chunks. Hierarchical orientation groups still implicitly batch
-cells; upstream integrates the entire mesh. With the ``element`` baseline,
+Autograd is disabled. ``--batch-size -1 --element-batch-size 0`` uses the full
+rule and all cells on both paths, without implicit orientation chunks.
+With the ``element`` baseline,
 upstream's geometry caches are retained during warmed calls and both the matrix
 and load assemblers remain resident. With ``mixed``, each implementation uses
 one assembler for matrices and loads and recomputes geometry during each call.
@@ -152,6 +166,17 @@ are retained for later checks. Diagnostic basis tabulation runs after timing so
 it cannot prewarm production caches or inflate GPU allocation measurements.
 Peak allocated GPU memory includes resident tensors and production caches. Each
 case starts in a fresh process, and the report is checkpointed after each worker.
+
+The table reports the median of ``--repeats`` warmed **full matrix assembly**
+calls, including host dispatch and GPU execution with synchronization. It does
+not report total benchmark runtime. Every successful timing worker also runs a
+first matrix and load call, ``--warmup`` calls of each, all load repetitions,
+and (on CUDA) a separate matrix and load memory measurement. With seven repeats
+and two warmups that is 11 matrix and 11 load calls per timing worker. Each
+worker independently imports packages, initializes CUDA, constructs the
+assembler and checks its operators. The default 11-case sweep uses 22 timing
+workers plus 12 validation workers. JSON records whole-worker wall seconds and
+total benchmark wall seconds; ``--inspect`` prints the total and worker count.
 
 Running the benchmark
 ---------------------
@@ -184,8 +209,8 @@ A CUDA sweep, sized explicitly for the available memory, can use:
 
 ``--extended`` adds degrees 8 and 10; these are opt-in. ``--threads`` controls
 PyTorch CPU threads. ``--batch-size`` counts quadrature points, with ``-1``
-meaning the complete rule. ``--element-batch-size`` caps cells per occupied
-orientation group, with ``0`` meaning the entire group. These parameters bound
+meaning the complete rule. ``--element-batch-size`` caps original-order cells
+across orientations, with ``0`` meaning all cells of each element type. These parameters bound
 integration scratch space, not full local matrix sources or CSR metadata.
 High-order mixed forms can exhaust memory even with small chunks.
 
@@ -281,8 +306,9 @@ CUDA memory is measured by a separate call after warmup. Baseline and peak
 allocated/reserved bytes, including incremental peaks, describe PyTorch's
 allocator; they are not driver memory or host RSS. The report also counts
 oriented reference storage, grouped connectivity/orientation, declared matrix/load
-CSR buffers, global values, and estimates local source and physical-gradient
-scratch sizes. These estimates omit
+CSR buffers, global values, and estimates local source, reference-gather and
+physical-gradient scratch sizes. Cell-batch counts are independent of the
+orientation histogram. These estimates omit
 weak-form intermediates and allocator overhead. CPU runs mark GPU memory as
 unavailable. Requests for unavailable CUDA emit a machine-readable unavailable
 report and return a nonzero exit status. Catchable allocation failures receive

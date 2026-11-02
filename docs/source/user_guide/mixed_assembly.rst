@@ -337,18 +337,20 @@ which work for nodal fields, and move data with
 ``layout.prolong`` / ``layout.restrict`` (isoparametric interpolation).
 
 
-Grouped hierarchical tetrahedra
+Cell-batched hierarchical tetrahedra
 ----------------------------------------
 
 Select ``Field(..., basis="hierarchical")`` on a tetrahedral mesh to use
 canonical vertex-ID-oriented edge and face functions. All fields share one
-topological partition into at most 24 orientation classes. Each occupied class
-uses shared reference values ``[Q,B]`` and gradients ``[Q,3,B]``; geometry stays
-nodal. Lagrange fields in the same mixed system share the group schedule while
-reusing their orientation-independent reference tables.
+topological partition into at most 24 orientation classes. Shared reference
+banks contain values ``[O,Q,B]`` and gradients ``[O,Q,3,B]``, where ``O`` is the
+number of occupied orientations; geometry stays nodal. Cell chunks span
+orientations in original mesh order and select the corresponding reference
+tables on the device. Equal-degree hierarchical fields share both the banks
+and active-chunk gathers. Lagrange fields reuse orientation-independent tables.
 
 The same weak-form interface applies. ``batch_size`` counts quadrature points;
-the optional ``element_batch_size`` independently limits cells in a group:
+the optional ``element_batch_size`` independently limits cells across orientations:
 
 .. code-block:: python
 
@@ -367,17 +369,26 @@ the optional ``element_batch_size`` independently limits cells in a group:
    b = assembler.assemble_vector(batch_size=16, element_batch_size=128)
    boundary = assembler.layout.boundary_mask("u")
 
-With ``element_batch_size=None``, every cell in the current group is integrated
-together. This parameter is available on the grouped tetrahedral path. It does
-not change public cell ordering: ``element_data`` stays in original mesh order.
+With ``element_batch_size=None``, all cells of each element type are integrated
+together, including all occupied orientations. A positive limit slices the
+original cell order, rather than restarting at each orientation. This parameter
+is available on the hierarchical tetrahedral path. ``element_data`` and field
+connectivity retain original mesh order.
 
-Completed local blocks occupy disjoint slices of a group-ordered source buffer.
+Completed local blocks occupy disjoint slices of an original-cell-order source buffer.
 One precomputed CSR projection per test/trial block combines them into sparse
 global values; loads use the analogous coefficient projection. This path does
 not call the older indexed matrix/load accumulation routines. Source buffers and
 CSR metadata still scale with all local basis pairs; chunking bounds integration
-scratch memory, not total assembly memory. GPU speedups depend on degree, group
-sizes, hardware, and form, and must be measured.
+scratch memory, not total assembly memory. Persistent reference storage scales
+with occupied orientations, while temporary reference gathers and weak-form
+intermediates scale with the active cell/quadrature chunk. Value-only forms can
+now carry a cell axis when orientations differ; unchunked mass assembly may
+therefore use more scratch than the previous per-orientation execution.
+GPU speedups depend on degree, chunk sizes, hardware, and form, and must be measured.
+
+Checkpoints from the earlier group-ordered assembly layout must be rebuilt;
+their reference-table and projection-buffer layouts differ from this version.
 
 The tetrahedral legacy rule indices 5--7 have verified exactness 4--6. To meet an
 explicit/default exactness request, grouped assembly selects rule indices 6, 7,

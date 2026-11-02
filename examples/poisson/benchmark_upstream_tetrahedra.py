@@ -202,7 +202,7 @@ def run_worker(job, result):
             "forward": mass if form == "mass" else poisson, "forward_vector": unit_load})
         asm = cls.from_mesh(mesh, quadrature_order=2*p)
         load_asm = None
-        result["assembly_api"] = ("MixedElementAssembler (grouped CSR)" if hierarchical else
+        result["assembly_api"] = ("MixedElementAssembler (cell-batched CSR)" if hierarchical else
                                   "MixedElementAssembler (default reduce projection)")
     else:
         cls = type("ComparisonLagrange", (tm.ElementAssembler,), {
@@ -218,10 +218,15 @@ def run_worker(job, result):
         seconds += extra
     result["setup"]["device_transfer_seconds"] = seconds
     result["setup"]["total_seconds"] = sum(result["setup"].values())
+    result["cell_batching"] = ("original_order_across_orientations" if hierarchical else
+                               "all_cells_per_element_type")
 
     with torch.no_grad():
-        matrix_fn = lambda: asm(batch_size=job["batch_size"])
-        load_fn = (lambda: asm.assemble_vector(batch_size=job["batch_size"])) if load_asm is None \
+        chunks = {"batch_size": job["batch_size"]}
+        if hierarchical:
+            chunks["element_batch_size"] = job.get("element_batch_size")
+        matrix_fn = lambda: asm(**chunks)
+        load_fn = (lambda: asm.assemble_vector(**chunks)) if load_asm is None \
             else (lambda: load_asm(batch_size=job["batch_size"]))
         matrix, first_matrix = timed(matrix_fn, device)
         cpu_matrix = sparse.coo_matrix((matrix.values.cpu().numpy().copy(),
@@ -316,8 +321,10 @@ def launch(job, directory, index):
           f"{job['form']} n={job['subdivisions']} {job['orientation']} "
           f"(upstream={job.get('upstream_assembler', 'element')})", file=sys.stderr, flush=True)
     with open(str(prefix) + ".log", "w") as log:
+        start = perf_counter()
         completed = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--worker", job_path],
                                    cwd=job["source"]["root"], env=env, stdout=log, stderr=log)
+        worker_seconds = perf_counter() - start
     result_path = Path(job["result"])
     result = json.loads(result_path.read_text()) if result_path.exists() else {
         **job, "status": "worker_failed", "reason": f"worker exit code {completed.returncode}"}
@@ -325,6 +332,7 @@ def launch(job, directory, index):
         result.update(status="worker_failed", reason=f"worker exit code {completed.returncode}")
     result["log"] = str(prefix) + ".log"
     result["returncode"] = completed.returncode
+    result["worker_wall_seconds"] = worker_seconds
     return result
 
 
@@ -351,6 +359,7 @@ def compare_operators(nodal, modal, tolerance):
 def timing_pair(nodal, modal, validation):
     result = {k: modal[k] for k in ("p", "form", "subdivisions", "orientation")}
     result["upstream_assembler"] = nodal.get("upstream_assembler", "element")
+    result["hierarchical_element_batch_size"] = modal.get("element_batch_size")
     result["cells"] = 6 * result["subdivisions"]**3
     result["status"] = "not_comparable"
     result["worker_status"] = {"lagrange": nodal["status"], "hierarchical": modal["status"]}
@@ -375,6 +384,7 @@ def timing_pair(nodal, modal, validation):
 
 
 def run(args):
+    start = perf_counter()
     upstream = source_info(args.upstream)
     if upstream["commit"] != args.upstream_commit or upstream["tracked_changes"]:
         raise ValueError(f"upstream must be a clean checkout at {args.upstream_commit}")
@@ -392,7 +402,13 @@ def run(args):
                   "upstream_assembler": args.upstream_assembler,
                   "forms": "scalar mass / Poisson and unit load", "geometry": "same affine Pp nodal mesh",
                   "quadrature": "same external conical Gauss-Jacobi rule; exact through 2*p+1",
-                  "batch_size": args.batch_size, "element_batch_size": None,
+                  "batch_size": args.batch_size,
+                  "hierarchical_element_batch_size": args.element_batch_size,
+                  "upstream_element_batch_size": None,
+                  "hierarchical_cell_batching": "original_order_across_orientations",
+                  "skip_cases": [{"p": p, "form": f, "subdivisions": n}
+                                 for p, f, n in args.skip_case],
+                  "repeats": args.repeats, "warmup": args.warmup,
                   "validation": "full A_H=T.T@A_L@T and b_H=T.T@b_L on 48 cells / 24 orientations",
                   "ratio": "L/H > 1 favors hierarchical; positive H time change means slower",
                   "adapters": "external quadrature + integer lattice-size fix on both checkouts",
@@ -404,8 +420,22 @@ def run(args):
     for p in args.degrees:
         for form in args.forms:
             check = None
-            for validation, n, orientation in [(True, 2, "balanced")] + [
-                    (False, n, o) for n in args.subdivisions for o in args.orientations]:
+            scheduled = []
+            for n in args.subdivisions:
+                for orientation in args.orientations:
+                    if (p, form, n) in args.skip_case:
+                        report["comparisons"].append({
+                            "p": p, "form": form, "subdivisions": n, "cells": 6*n**3,
+                            "orientation": orientation, "status": "skipped",
+                            "reason": "excluded by --skip-case before mesh construction or worker launch",
+                            "upstream_assembler": args.upstream_assembler})
+                        print(f"skip P{p} {form} n={n} {orientation}", file=sys.stderr, flush=True)
+                    else:
+                        scheduled.append((False, n, orientation))
+            write_json(output, report)
+            if not scheduled:
+                continue
+            for validation, n, orientation in [(True, 2, "balanced")] + scheduled:
                 if not validation and not check["passed"]:
                     report["comparisons"].append({"p": p, "form": form, "subdivisions": n,
                                                   "orientation": orientation, "status": "validation_failed",
@@ -424,7 +454,9 @@ def run(args):
                            "family": family, "p": p, "form": form, "subdivisions": n,
                            "orientation": orientation, "input": str(input_path), "validation": validation,
                            "device": args.device, "dtype": args.dtype, "threads": args.threads,
-                           "batch_size": args.batch_size, "element_batch_size": None,
+                           "batch_size": args.batch_size,
+                           "element_batch_size": (args.element_batch_size
+                                                  if family == "hierarchical" else None),
                            "repeats": args.repeats, "warmup": args.warmup}
                     pair[family] = launch(job, directory, index)
                     index += 1
@@ -438,9 +470,11 @@ def run(args):
                 else:
                     report["comparisons"].append(timing_pair(pair["lagrange"], pair["hierarchical"], check))
                 write_json(output, report)
-    report["status"] = "completed" if all(c["status"] == "passed" for c in report["comparisons"]) else "incomplete"
+    report["status"] = "completed" if all(c["status"] in ("passed", "skipped")
+                                         for c in report["comparisons"]) else "incomplete"
     report["gpu_performance_measured"] = args.device.startswith("cuda") and any(
         c["status"] == "passed" for c in report["comparisons"])
+    report["wall_seconds"] = perf_counter() - start
     report = json_safe(report)
     write_json(output, report)
     return report
@@ -455,13 +489,30 @@ def inspect_reports(paths):
               f"{environment.get('device_model', '')}; batch size: {report['protocol']['batch_size']}")
         upstream_api = ("MixedElementAssembler" if report["protocol"].get(
             "upstream_assembler", "element") == "mixed" else "ElementAssembler / NodeAssembler")
-        print(f"L: upstream {upstream_api}; H: feature grouped MixedElementAssembler")
+        cell_batched = report["protocol"].get("hierarchical_cell_batching") == \
+            "original_order_across_orientations"
+        print(f"L: upstream {upstream_api}; H: feature "
+              f"{'cell-batched' if cell_batched else 'grouped'} MixedElementAssembler")
+        if cell_batched:
+            limit = report["protocol"]["hierarchical_element_batch_size"]
+            print(f"Cell chunks: L all cells; H {limit or 'all cells'}, spanning orientations")
+        repeats = report["protocol"].get("repeats")
+        if repeats is not None:
+            print(f"Each time is the median of {repeats} warmed matrix calls; "
+                  "setup, first calls and load timings are separate in JSON.")
+        if "wall_seconds" in report:
+            print(f"Total benchmark wall time: {report['wall_seconds']:.1f} s; "
+                  f"{len(report['cases'])} isolated workers")
         print("Matrix times; L/H > 1 favors hierarchical; H change > 0 means slower.")
         print(f"{'p':>2} {'Cells':>8} {'Form':8} {'Orientation':11} {'L ms':>10} {'H ms':>10} "
               f"{'L/H':>7} {'H change':>10} {'L GiB':>8} {'H GiB':>8}")
         cases = {(c['p'], c['form'], c['subdivisions'], c['orientation'], c['family']): c
                  for c in report['cases'] if not c['validation']}
         for c in report["comparisons"]:
+            if c["status"] == "skipped":
+                print(f"P{c['p']} n={c['subdivisions']} {c['form']} {c['orientation']}: "
+                      f"skipped ({c['reason']})")
+                continue
             if c["status"] != "passed":
                 print(f"P{c['p']} n={c['subdivisions']} {c['form']} {c['orientation']}: "
                       f"{c['status']} {c.get('worker_status', '')}")
@@ -497,6 +548,13 @@ def main(argv=None):
     parser.add_argument("--subdivisions", nargs="+", type=int, default=[2, 4])
     parser.add_argument("--orientations", nargs="+", choices=("balanced", "single"), default=["balanced"])
     parser.add_argument("--batch-size", type=int, default=-1, help="quadrature points per batch on BOTH paths")
+    parser.add_argument("--element-batch-size", type=int, default=0,
+                        help="hierarchical-only cell chunk across orientations; 0 means all cells "
+                             "(upstream always processes all cells)")
+    parser.add_argument("--skip-case", nargs=3, action="append", default=[("6", "poisson", "4")],
+                        metavar=("P", "FORM", "SUBDIVISIONS"),
+                        help="exclude a timing case before launching workers; repeatable; "
+                             "P6 Poisson at subdivisions=4 is skipped by default")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=2)
@@ -517,6 +575,16 @@ def main(argv=None):
         parser.error("subdivisions, threads, repeats and warmup must be positive")
     if args.batch_size != -1 and args.batch_size < 1:
         parser.error("batch size must be -1 or positive")
+    if args.element_batch_size < 0:
+        parser.error("element batch size must be zero (all cells) or positive")
+    args.element_batch_size = args.element_batch_size or None
+    try:
+        args.skip_case = [(int(p), form, int(n)) for p, form, n in args.skip_case]
+        if any(p < 3 or p > 10 or form not in ("mass", "poisson") or n < 1
+               for p, form, n in args.skip_case):
+            raise ValueError
+    except ValueError:
+        parser.error("skip cases require degree 3..10, mass/poisson, and positive subdivisions")
     report = run(args)
     print(json.dumps(report, indent=2, allow_nan=False))
     return 0 if report["status"] == "completed" else 1
