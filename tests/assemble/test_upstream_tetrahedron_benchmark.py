@@ -78,24 +78,34 @@ def run_isolated(tmp_path, extra, expected_returncode=0):
     return report
 
 
-def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys):
-    report = run_isolated(tmp_path, ["--degrees", "3", "4", "6", "--forms", "mass", "poisson"])
+@pytest.mark.parametrize("upstream_assembler", ["element", "mixed"])
+def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys, upstream_assembler):
+    report = run_isolated(tmp_path, ["--degrees", "3", "4", "6", "--forms", "mass", "poisson",
+                                     "--upstream-assembler", upstream_assembler])
     assert report["upstream"]["commit"] == PINNED_UPSTREAM
+    assert report["protocol"]["upstream_assembler"] == upstream_assembler
     assert report["status"] == "completed"
     assert len(report["validation"]) == len(report["comparisons"]) == 6
     assert not report["gpu_performance_measured"]
+    expected = "MixedElementAssembler" if upstream_assembler == "mixed" else "ElementAssembler"
     for check in report["validation"]:
+        assert check["upstream_assembler"] == upstream_assembler
         assert check["passed"]
         assert check["matrix_change_of_basis_error"] < 2e-8
         assert check["load_change_of_basis_error"] < 2e-8
     for case in report["cases"]:
         assert case["numerical"]["passed"]
+        if case["family"] == "lagrange":
+            assert case["assembly_api"].startswith(expected)
         root = Path(case["source"]["root"]) / "tensormesh"
         assert all(Path(path).is_relative_to(root) for path in case["imported_modules"].values())
         assert case["source"]["root"] == report[
             "upstream" if case["family"] == "lagrange" else "feature"]["root"]
     inspect_reports([tmp_path / "comparison.json"])
-    assert "H change" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "H change" in printed
+    assert f"L: upstream {expected}" in printed
+    assert all(c["upstream_assembler"] == upstream_assembler for c in report["comparisons"])
     pair = {c["family"]: c for c in report["cases"] if not c["validation"]
             and c["p"] == 3 and c["form"] == "mass"}
     # Numerically passing runs must still be rejected if the supplied rules differ.
@@ -105,9 +115,11 @@ def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys)
     assert "operations" not in comparison
 
 
-def test_real_upstream_p5_chunked_quadrature_and_single_orientation(tmp_path):
+@pytest.mark.parametrize("upstream_assembler", ["element", "mixed"])
+def test_real_upstream_p5_chunked_quadrature_and_single_orientation(tmp_path, upstream_assembler):
     report = run_isolated(tmp_path, ["--degrees", "5", "--forms", "poisson", "--batch-size", "17",
-                                     "--orientations", "balanced", "single"])
+                                     "--orientations", "balanced", "single",
+                                     "--upstream-assembler", upstream_assembler])
     assert report["validation"][0]["passed"]
     assert len(report["comparisons"]) == 2
     for case in report["cases"]:
@@ -141,8 +153,10 @@ def test_failed_validation_never_produces_a_timing_ratio():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-def test_real_upstream_cuda_operator_equivalence_and_memory(tmp_path):
-    report = run_isolated(tmp_path, ["--device", "cuda", "--degrees", "3", "--forms", "poisson"])
+@pytest.mark.parametrize("upstream_assembler", ["element", "mixed"])
+def test_real_upstream_cuda_operator_equivalence_and_memory(tmp_path, upstream_assembler):
+    report = run_isolated(tmp_path, ["--device", "cuda", "--degrees", "3", "--forms", "poisson",
+                                     "--upstream-assembler", upstream_assembler])
     assert report["gpu_performance_measured"]
     for case in report["cases"]:
         if not case["validation"]:

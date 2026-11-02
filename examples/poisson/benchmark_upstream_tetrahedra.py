@@ -193,13 +193,17 @@ def run_worker(job, result):
     mesh = mesh.to(dtype=dtype)
     result["setup"] = {"mesh_seconds": perf_counter() - start}
     start = perf_counter()
-    if job["family"] == "hierarchical":
-        cls = type("ComparisonHierarchical", (tm.MixedElementAssembler,), {
-            "fields": [tm.Field("u", "v", p, basis="hierarchical")],
+    hierarchical = job["family"] == "hierarchical"
+    if hierarchical or job.get("upstream_assembler", "element") == "mixed":
+        # Upstream Field has no basis keyword; its default is nodal Lagrange.
+        field = tm.Field("u", "v", p, **({"basis": "hierarchical"} if hierarchical else {}))
+        cls = type("ComparisonMixed", (tm.MixedElementAssembler,), {
+            "fields": [field],
             "forward": mass if form == "mass" else poisson, "forward_vector": unit_load})
         asm = cls.from_mesh(mesh, quadrature_order=2*p)
         load_asm = None
-        result["assembly_api"] = "MixedElementAssembler (grouped CSR)"
+        result["assembly_api"] = ("MixedElementAssembler (grouped CSR)" if hierarchical else
+                                  "MixedElementAssembler (default reduce projection)")
     else:
         cls = type("ComparisonLagrange", (tm.ElementAssembler,), {
             "forward": mass if form == "mass" else poisson})
@@ -309,7 +313,8 @@ def launch(job, directory, index):
                OMP_NUM_THREADS=str(job["threads"]), OPENBLAS_NUM_THREADS=str(job["threads"]),
                MKL_NUM_THREADS=str(job["threads"]), VECLIB_MAXIMUM_THREADS=str(job["threads"]))
     print(f"{'check' if job['validation'] else 'time'} {job['family']} P{job['p']} "
-          f"{job['form']} n={job['subdivisions']} {job['orientation']}", file=sys.stderr, flush=True)
+          f"{job['form']} n={job['subdivisions']} {job['orientation']} "
+          f"(upstream={job.get('upstream_assembler', 'element')})", file=sys.stderr, flush=True)
     with open(str(prefix) + ".log", "w") as log:
         completed = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--worker", job_path],
                                    cwd=job["source"]["root"], env=env, stdout=log, stderr=log)
@@ -345,6 +350,7 @@ def compare_operators(nodal, modal, tolerance):
 
 def timing_pair(nodal, modal, validation):
     result = {k: modal[k] for k in ("p", "form", "subdivisions", "orientation")}
+    result["upstream_assembler"] = nodal.get("upstream_assembler", "element")
     result["cells"] = 6 * result["subdivisions"]**3
     result["status"] = "not_comparable"
     result["worker_status"] = {"lagrange": nodal["status"], "hierarchical": modal["status"]}
@@ -383,6 +389,7 @@ def run(args):
                                           np.frombuffer(Path(__file__).with_name(
                                               "_tetrahedron_comparison.py").read_bytes(), dtype=np.uint8)),
               "artifacts": str(directory), "protocol": {
+                  "upstream_assembler": args.upstream_assembler,
                   "forms": "scalar mass / Poisson and unit load", "geometry": "same affine Pp nodal mesh",
                   "quadrature": "same external conical Gauss-Jacobi rule; exact through 2*p+1",
                   "batch_size": args.batch_size, "element_batch_size": None,
@@ -391,7 +398,7 @@ def run(args):
                   "adapters": "external quadrature + integer lattice-size fix on both checkouts",
                   "isolation": "fresh process per implementation, degree, mesh and form",
                   "timing": "forward-only warmed public assembly, synchronized wall clock",
-                  "memory": "both matrix and load assemblers resident; outputs released before samples"},
+                  "memory": "matrix/load assembly state resident; GPU outputs released before samples"},
               "validation": [], "cases": [], "comparisons": [], "gpu_performance_measured": False}
     index = 0
     for p in args.degrees:
@@ -401,7 +408,8 @@ def run(args):
                     (False, n, o) for n in args.subdivisions for o in args.orientations]:
                 if not validation and not check["passed"]:
                     report["comparisons"].append({"p": p, "form": form, "subdivisions": n,
-                                                  "orientation": orientation, "status": "validation_failed"})
+                                                  "orientation": orientation, "status": "validation_failed",
+                                                  "upstream_assembler": args.upstream_assembler})
                     continue
                 data = {**high_order_cube(n, p, orientation), **quadrature(p)}
                 input_path = directory / f"input-{p}-{n}-{orientation}.npz"
@@ -412,6 +420,7 @@ def run(args):
                 families = ("lagrange", "hierarchical") if index % 4 == 0 else ("hierarchical", "lagrange")
                 for family in families:
                     job = {"source": upstream if family == "lagrange" else feature,
+                           "upstream_assembler": args.upstream_assembler,
                            "family": family, "p": p, "form": form, "subdivisions": n,
                            "orientation": orientation, "input": str(input_path), "validation": validation,
                            "device": args.device, "dtype": args.dtype, "threads": args.threads,
@@ -424,7 +433,8 @@ def run(args):
                 if validation:
                     check = compare_operators(pair["lagrange"], pair["hierarchical"],
                                               3e-4 if args.dtype == "float32" else 2e-8)
-                    report["validation"].append({"p": p, "form": form, **check})
+                    report["validation"].append({"p": p, "form": form,
+                                                  "upstream_assembler": args.upstream_assembler, **check})
                 else:
                     report["comparisons"].append(timing_pair(pair["lagrange"], pair["hierarchical"], check))
                 write_json(output, report)
@@ -443,6 +453,9 @@ def inspect_reports(paths):
         environment = next((c["environment"] for c in report["cases"] if "environment" in c), {})
         print(f"Device: {environment.get('device', 'unknown')} "
               f"{environment.get('device_model', '')}; batch size: {report['protocol']['batch_size']}")
+        upstream_api = ("MixedElementAssembler" if report["protocol"].get(
+            "upstream_assembler", "element") == "mixed" else "ElementAssembler / NodeAssembler")
+        print(f"L: upstream {upstream_api}; H: feature grouped MixedElementAssembler")
         print("Matrix times; L/H > 1 favors hierarchical; H change > 0 means slower.")
         print(f"{'p':>2} {'Cells':>8} {'Form':8} {'Orientation':11} {'L ms':>10} {'H ms':>10} "
               f"{'L/H':>7} {'H change':>10} {'L GiB':>8} {'H GiB':>8}")
@@ -475,6 +488,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upstream", type=Path, help="separate clean upstream checkout")
     parser.add_argument("--upstream-commit", default=PINNED_UPSTREAM)
+    parser.add_argument("--upstream-assembler", choices=("element", "mixed"), default="element",
+                        help="upstream Lagrange API: element (original baseline) or mixed")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=("float64", "float32"), default="float64")
     parser.add_argument("--degrees", nargs="+", type=int, default=[3, 4, 6])

@@ -14,9 +14,12 @@ Use ``examples/poisson/benchmark_upstream_tetrahedra.py`` to answer how much
 assembly time changes when switching from upstream Lagrange to hierarchical
 tetrahedra at P3/P4/P6. This is a separate, process-isolated comparison against
 ``camlab-ethz/TensorMesh`` commit
-``2d544e8bc7ee8de412ffbc768b313875c3b12895``. The baseline calls upstream's
-``ElementAssembler`` and ``NodeAssembler`` with their default reduce projector;
-the feature calls grouped ``MixedElementAssembler`` with CSR projection.
+``2d544e8bc7ee8de412ffbc768b313875c3b12895``. Select the upstream Lagrange API
+with ``--upstream-assembler element`` (the default: ``ElementAssembler`` and
+``NodeAssembler``) or ``--upstream-assembler mixed`` (``MixedElementAssembler``
+for both matrices and loads). Both upstream choices use reduction-based global
+accumulation; the feature calls grouped ``MixedElementAssembler`` with CSR
+projection. The chosen baseline is recorded in JSON and printed by ``--inspect``.
 
 Prepare the baseline once (no second package installation is needed):
 
@@ -52,6 +55,40 @@ before ratios are emitted. An OOM or failed check has an explicit status instead
 of a speedup. P6 with 384 cells can exceed an 11 GB GPU's capacity on the upstream
 unchunked path; the 48-cell comparison is still reported. Use the same smaller
 ``--batch-size`` on both paths for a separately labeled chunked experiment.
+
+Mixed-assembler comparison
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To compare through ``MixedElementAssembler`` on both checkouts, run:
+
+.. code-block:: bash
+
+   python examples/poisson/benchmark_upstream_tetrahedra.py \
+       --upstream ../TensorMesh-upstream --upstream-assembler mixed \
+       --device cuda --dtype float64 --degrees 3 4 6 \
+       --forms mass poisson --subdivisions 2 4 \
+       --batch-size -1 --repeats 7 --warmup 2 \
+       --output dist/tetra-upstream-mixed-gpu.json \
+       > dist/tetra-upstream-mixed-gpu.stdout.json
+
+   python examples/poisson/benchmark_upstream_tetrahedra.py \
+       --inspect dist/tetra-upstream-mixed-gpu.json
+
+This uses the same scalar mass/Poisson forms and a single degree-p field on each
+side. Upstream declares ``Field("u", "v", p)``; the feature selects the
+hierarchical basis. The field degree matches the nodal mesh degree, so upstream
+uses the existing mesh connectivity even at P3/P4/P6. The same quadrature and
+lattice adapters and full operator-equivalence checks apply to either baseline.
+
+Both mixed paths recompute geometry and physical field gradients on each call.
+This removes the original comparison's ``ElementAssembler`` versus
+``MixedElementAssembler`` execution/caching difference. Orientation-group
+scheduling, local-buffer packing, and CSR versus reduction projection still
+differ. This measures the hierarchical extension to mixed assembly, including
+those implementation choices. It does not introduce new coupled Stokes forms.
+
+Pass several explicit report filenames to ``--inspect`` to display both
+baseline comparisons; each table identifies its upstream assembler.
 
 Matched inputs and explicit adapters
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -106,8 +143,10 @@ are retained in a uniquely named directory beside the report.
 Setup and first calls are separated from warmed synchronized wall-clock samples.
 Autograd is disabled. ``--batch-size -1`` uses the full rule on both paths, with
 no explicit cell chunks. Hierarchical orientation groups still implicitly batch
-cells; upstream integrates the entire mesh. Upstream's geometry caches are
-retained during warmed calls. Both matrix and load assemblers remain resident.
+cells; upstream integrates the entire mesh. With the ``element`` baseline,
+upstream's geometry caches are retained during warmed calls and both the matrix
+and load assemblers remain resident. With ``mixed``, each implementation uses
+one assembler for matrices and loads and recomputes geometry during each call.
 GPU outputs are released before timing samples; CPU copies of the first outputs
 are retained for later checks. Diagnostic basis tabulation runs after timing so
 it cannot prewarm production caches or inflate GPU allocation measurements.
