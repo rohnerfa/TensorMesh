@@ -1,4 +1,4 @@
-"""Tetrahedral Gaussian exactness, rule lifecycle, and legacy-table audit."""
+"""Tetrahedral Gaussian exactness, rule lifecycle, and tabulated-rule audit."""
 
 import hashlib
 import math
@@ -37,7 +37,7 @@ def _assert_tetrahedron_moments(weights, points, degree, rtol=5e-13):
         torch.testing.assert_close(actual / exact, torch.ones_like(exact), rtol=rtol, atol=0)
 
 
-@pytest.mark.parametrize("degree", [8, 9, 10, 11, 12, 16, 20, 21, 30])
+@pytest.mark.parametrize("degree", [7, 8, 9, 10, 11, 12, 16, 20, 21, 30])
 def test_generated_tetrahedron_all_analytic_moments(degree):
     weights, points = Tetrahedron.get_quadrature(degree, dtype=torch.float64)
     n = math.ceil((degree + 1) / 2)
@@ -56,47 +56,33 @@ def test_generated_tetrahedron_all_analytic_moments(degree):
 
 # Exact little-endian float64 snapshots from prerequisite 93d96117c06e39e1.
 # These protect every table entry and its ordering, not just volume/exactness.
-_LEGACY_RULES = [
+# The former degree-6/7 tables are now correctly labelled degree 5/6.
+_TABULATED_RULES = [
     (1, "e16c38822d28f113093ca57981727fc41af26fd1d00dc325796f7eced47d43d5"),
     (4, "0098da04a31975dc836c7a4d5afbe0d9d12a0aac9411f20066e9ed5ea104e91c"),
     (5, "9d1790148861e6ada3ccf72149b06216e4f9a1a8292dcd792621bc5048256465"),
     (11, "43e54045c4b33eca25191027233ee02f6a792a5181fa2a0e964f0ef89d6046e1"),
-    (14, "eba7979a2f2b37b6ccabffd6a933f47f4f37f374e0f82b11e0f5053f148dcf3d"),
     (15, "902bcc9504af32858fdd22b45fe7f853ccdd17ac67ab0388094276fb99ceecfa"),
     (24, "0bd7ba144ff32b59f1d4e8158eda911c7f35dc62332036dc9d40ff0136d48cd4"),
 ]
 
 
-@pytest.mark.parametrize("order", range(1, 8))
-def test_legacy_tetrahedron_tables_and_point_order_are_unchanged(order):
+@pytest.mark.parametrize("order", range(1, 7))
+def test_tabulated_tetrahedron_rules_and_point_order(order):
     weights, points = Tetrahedron.get_quadrature(order, dtype=torch.float64)
-    count, fingerprint = _LEGACY_RULES[order - 1]
+    count, fingerprint = _TABULATED_RULES[order - 1]
     assert weights.shape == (count,) and points.shape == (count, 3)
     values = torch.cat((weights, points.flatten())).tolist()
     assert hashlib.sha256(struct.pack(f"<{len(values)}d", *values)).hexdigest() == fingerprint
     if order in (3, 4):
         assert weights[0] < 0
-    if order in (5, 6):
-        assert (points == 0).any()  # original boundary points remain present
-    _assert_tetrahedron_moments(weights, points, order if order <= 4 else order - 1)
+    if order == 5:
+        assert (points == 0).any()  # the 15-point rule includes face points
+    _assert_tetrahedron_moments(weights, points, order)
 
 
-@pytest.mark.parametrize("order", [
-    1, 2, 3, 4,
-    pytest.param(5, marks=pytest.mark.xfail(
-        strict=True, raises=AssertionError,
-        reason="Legacy order-5 table misses degree-5 moments (e.g. x**5)"
-    )),
-    pytest.param(6, marks=pytest.mark.xfail(
-        strict=True, raises=AssertionError,
-        reason="Legacy order-6 table misses degree-6 moments (e.g. x**6)"
-    )),
-    pytest.param(7, marks=pytest.mark.xfail(
-        strict=True, raises=AssertionError,
-        reason="Legacy order-7 table misses degree-7 moments (e.g. x**7)"
-    )),
-])
-def test_legacy_tetrahedron_advertised_exactness_audit(order):
+@pytest.mark.parametrize("order", range(1, 8))
+def test_tetrahedron_advertised_exactness(order):
     weights, points = Tetrahedron.get_quadrature(order, dtype=torch.float64)
     _assert_tetrahedron_moments(weights, points, order)
 
@@ -157,30 +143,32 @@ def test_generated_tetrahedron_canonical_cache_ignores_default_device_and_dtype(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_generated_tetrahedron_requested_cpu_dtype(dtype):
-    weights, points = Tetrahedron.get_quadrature(10, dtype=dtype, device=torch.device("cpu"))
+@pytest.mark.parametrize("degree", [5, 6, 7, 10])
+def test_tetrahedron_requested_cpu_dtype(dtype, degree):
+    weights, points = Tetrahedron.get_quadrature(degree, dtype=dtype, device=torch.device("cpu"))
     assert weights.dtype == points.dtype == dtype
     assert weights.device.type == points.device.type == "cpu"
     _assert_tetrahedron_moments(
-        weights, points, degree=10, rtol=2e-6 if dtype == torch.float32 else 5e-13
+        weights, points, degree=degree, rtol=2e-6 if dtype == torch.float32 else 5e-13
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_generated_tetrahedron_cuda_conversion_and_moments(dtype):
-    reference = quadrature.tet_quadrature(10, dtype=dtype)
-    weights, points = quadrature.tet_quadrature(10, dtype=dtype, device="cuda")
+@pytest.mark.parametrize("degree", [5, 6, 7, 10])
+def test_tetrahedron_cuda_conversion_and_moments(dtype, degree):
+    reference = quadrature.tet_quadrature(degree, dtype=dtype)
+    weights, points = quadrature.tet_quadrature(degree, dtype=dtype, device="cuda")
     assert weights.dtype == points.dtype == dtype
     assert weights.device.type == points.device.type == "cuda"
     for actual, expected in zip((weights, points), reference):
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
     _assert_tetrahedron_moments(
-        weights, points, degree=10, rtol=2e-6 if dtype == torch.float32 else 5e-13
+        weights, points, degree=degree, rtol=2e-6 if dtype == torch.float32 else 5e-13
     )
     weights.zero_()
     points.zero_()
-    for actual, expected in zip(quadrature.tet_quadrature(10, dtype=dtype), reference):
+    for actual, expected in zip(quadrature.tet_quadrature(degree, dtype=dtype), reference):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
