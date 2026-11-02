@@ -253,14 +253,14 @@ def test_invalid_element_batch_size_rejected_for_both_forms(size):
             assemble(element_batch_size=size)
 
 
-def test_csr_source_order_and_duplicate_sums_for_matrix_and_load():
+def test_reduction_source_order_and_duplicate_sums_for_matrix_and_load():
     asm = mixed_form().from_mesh(patch_mesh())
     for beta in asm.fields:
         source_conn = torch.cat([asm.field_conn[f"{beta.trial}__{kind}"].reshape(-1)
                                  for kind in asm.element_types])
         projector = asm.grouping.vector_projector[beta.trial]
-        assert isinstance(projector, SparseProjector)
-        assert projector.projection.layout == torch.sparse_csr
+        assert isinstance(projector, ReduceProjector)
+        torch.testing.assert_close(projector.indices, source_conn)
         source = torch.arange(len(source_conn) * beta.components, dtype=DTYPE).reshape(
             len(source_conn), beta.components) / 13
         expected = torch.zeros(asm.layout.n_nodes(beta.trial), beta.components, dtype=DTYPE)
@@ -270,9 +270,8 @@ def test_csr_source_order_and_duplicate_sums_for_matrix_and_load():
         for alpha in asm.fields:
             key = f"{beta.trial}__{alpha.trial}"
             projector = asm.grouping.pair_projector[key]
-            assert isinstance(projector, SparseProjector)
-            assert projector.projection.layout == torch.sparse_csr
-            size = projector.projection.shape[1]
+            assert isinstance(projector, ReduceProjector)
+            size = projector.indices.numel()
             assert projector.from_shape == (size,)
             source = torch.arange(size * beta.components * alpha.components, dtype=DTYPE)
             source = source.reshape(size, beta.components, alpha.components) / 29
@@ -308,7 +307,7 @@ def _cache_form():
     return Shared
 
 
-def test_registered_shared_tables_and_csr_hot_path_without_index_add(monkeypatch):
+def test_registered_shared_tables_and_reduction_hot_path(monkeypatch):
     calls = []
     original = Tetrahedron.get_hierarchical_basis_fns
 
@@ -338,11 +337,10 @@ def test_registered_shared_tables_and_csr_hot_path_without_index_add(monkeypatch
     expected_matrix, expected_load = asm().to_dense(), asm.assemble_vector()
 
     def fail(*args, **kwargs):
-        raise AssertionError("Grouped assembly must reuse tables and CSR projection")
+        raise AssertionError("Grouped assembly must reuse tables and reduction maps")
 
     monkeypatch.setattr(Tetrahedron, "get_hierarchical_basis_fns", fail)
-    monkeypatch.setattr(ReduceProjector, "__call__", fail)
-    monkeypatch.setattr(torch.Tensor, "index_add_", fail)
+    monkeypatch.setattr(SparseProjector, "__call__", fail)
     torch.testing.assert_close(asm(batch_size=17, element_batch_size=1).to_dense(), expected_matrix)
     torch.testing.assert_close(asm.assemble_vector(batch_size=17, element_batch_size=1), expected_load)
 
@@ -427,8 +425,8 @@ def test_group_cache_state_roundtrip_and_dtype_device_movement(device):
         assert buffer.device.type == device and buffer.dtype == torch.int64
     for projector in (*other.grouping.pair_projector.values(),
                       *other.grouping.vector_projector.values()):
-        assert projector.projection.dtype == torch.float32
-        assert projector.projection.crow_indices().dtype in (torch.int32, torch.int64)
+        assert projector.indices.dtype == torch.int64
+        assert projector.indices.device.type == device
     torch.testing.assert_close(other().to_dense().cpu().double(), matrix, atol=3e-6, rtol=3e-5)
     torch.testing.assert_close(other.assemble_vector().cpu().double(), load, atol=3e-6, rtol=3e-5)
     other.double()
@@ -452,8 +450,8 @@ def test_grouped_setup_from_cuda_quadratic_mesh_with_hierarchical_lagrange_field
     assert all(table.is_cuda and table.dtype == DTYPE for table in gpu.grouping.ref_val.values())
     for projector in (*gpu.grouping.pair_projector.values(),
                       *gpu.grouping.vector_projector.values()):
-        assert projector.projection.is_cuda
-        assert projector.projection.layout == torch.sparse_csr
+        assert projector.indices.is_cuda
+        assert projector.indices.dtype == torch.int64
     actual_matrix = gpu(batch_size=37, element_batch_size=2).to_dense()
     actual_load = gpu.assemble_vector(batch_size=37, element_batch_size=2)
     assert actual_matrix.is_cuda and actual_load.is_cuda
