@@ -189,8 +189,7 @@ def test_real_upstream_matrix_profiles_use_both_selected_checkouts(tmp_path, cap
         profile = case["matrix_profile"]
         assert profile["output_equivalence"] == "passed"
         assert profile["stages"]["weak_form_evaluation"]["calls_per_assembly"] == 1
-        expected = "SparseProjector" if case["family"] == "hierarchical" else "ReduceProjector"
-        assert all(probe["production_projector"] == expected
+        assert all(probe["production_projector"] == "ReduceProjector"
                    for probe in profile["projection_probe"].values())
         assert Path(profile["operators"]["trace_path"]).is_file()
         root = Path(case["source"]["root"]) / "tensormesh"

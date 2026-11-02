@@ -2,7 +2,7 @@
 
 Run from the repository root. JSON is written to stdout (progress to stderr),
 and optionally to --output. Stage reconstruction uses the production tensor
-kernels, but independently schedules packing and CSR projection. It streams
+kernels, but independently schedules packing and reduction projection. It streams
 quadrature batches rather than retaining a mesh-sized collection of gradients.
 """
 
@@ -285,7 +285,7 @@ def data_for(asm, form, shift=0.0):
 
 def reconstruct(asm, matrix=True, batch_size=16, element_batch_size=None, field_data=None,
                 reference_mode="auto"):
-    """Stream geometry, kernels, packing and CSR projection independently.
+    """Stream geometry, kernels, packing and reduction projection independently.
 
     Returns
     -------
@@ -370,7 +370,7 @@ def reconstruct(asm, matrix=True, batch_size=16, element_batch_size=None, field_
     projected = {}
     for key, source in sources.items():
         projected[key], elapsed = timed_call(lambda: projectors[key](source), asm.device)
-        seconds["csr_projection"] += elapsed
+        seconds["global_projection"] += elapsed
 
     def finish():
         if matrix:
@@ -436,7 +436,7 @@ def numerical_diagnostics(asm, matrix, load, form, shift=0.0):
 
 
 def storage_report(asm, batch_size, element_batch_size):
-    """Persistent table/CSR storage and explicit scratch/source size estimates."""
+    """Persistent table/index storage and explicit scratch/source size estimates."""
     if not asm.grouped_tetrahedra:
         return {"status": "not_grouped"}
     grouping = asm.grouping
@@ -445,12 +445,9 @@ def storage_report(asm, batch_size, element_batch_size):
     # BufferDict normally registers each space once; count shared storage once too.
     storage = {tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
                for tensor in tables}
-    csr_bytes = 0
-    for projector in itertools.chain(grouping.pair_projector.values(),
-                                     grouping.vector_projector.values()):
-        csr = projector.projection
-        csr_bytes += sum(t.numel() * t.element_size() for t in
-                         (csr.crow_indices(), csr.col_indices(), csr.values()))
+    projection_bytes = sum(projector.indices.numel() * projector.indices.element_size()
+                           for projector in itertools.chain(grouping.pair_projector.values(),
+                                                            grouping.vector_projector.values()))
     local_bytes = sum(grouping.pair_projector[f"{beta.trial}__{alpha.trial}"].from_shape[0]
                       * beta.components * alpha.components * size
                       for beta in asm.fields for alpha in asm.fields)
@@ -481,7 +478,8 @@ def storage_report(asm, batch_size, element_batch_size):
         largest_reference_gather = max(largest_reference_gather,
                                        4 * cells * nq * modal_width * size)
     return {"oriented_reference_storage_bytes": sum(storage.values()),
-            "all_declared_matrix_and_load_csr_bytes": csr_bytes,
+            "projection_backend": "ReduceProjector",
+            "all_declared_matrix_and_load_projection_bytes": projection_bytes,
             "all_declared_local_matrix_source_bytes": local_bytes,
             "all_declared_local_load_source_bytes": load_bytes,
             "all_declared_global_matrix_values_bytes": global_bytes,

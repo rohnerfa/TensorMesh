@@ -206,7 +206,7 @@ def run_worker(job, result):
             "forward": mass if form == "mass" else poisson, "forward_vector": unit_load})
         asm = cls.from_mesh(mesh, quadrature_order=2*p)
         load_asm = None
-        result["assembly_api"] = ("MixedElementAssembler (cell-batched CSR)" if hierarchical else
+        result["assembly_api"] = ("MixedElementAssembler (cell-batched reduction)" if hierarchical else
                                   "MixedElementAssembler (default reduce projection)")
     else:
         cls = type("ComparisonLagrange", (tm.ElementAssembler,), {

@@ -58,7 +58,7 @@ def test_stage_reconstruction_matches_chunked_public_assembly_and_analytic_cube(
         assert numerical_diagnostics(asm, matrix, load, form, 0.5)["passed"]
     for stages in (matrix_stages, vector_stages):
         assert {"geometry_data_and_physical_gradients", "local_buffer_packing",
-                "csr_projection"} <= stages.keys()
+                "global_projection"} <= stages.keys()
         assert {"reference_form_evaluation", "cell_form_evaluation"} & stages.keys()
         assert {"reference_contraction", "cell_quadrature"} & stages.keys()
     shared_matrix = reference_mode == "auto" and form == "mass"

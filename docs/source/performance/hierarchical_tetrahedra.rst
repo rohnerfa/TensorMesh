@@ -18,8 +18,8 @@ tetrahedra at P3/P4/P6. This is a separate, process-isolated comparison against
 with ``--upstream-assembler element`` (the default: ``ElementAssembler`` and
 ``NodeAssembler``) or ``--upstream-assembler mixed`` (``MixedElementAssembler``
 for both matrices and loads). Both upstream choices use reduction-based global
-accumulation; the feature calls grouped ``MixedElementAssembler`` with CSR
-projection. The chosen baseline is recorded in JSON and printed by ``--inspect``.
+accumulation; the feature also uses ``ReduceProjector`` for grouped matrix/load
+assembly. The chosen baseline is recorded in JSON and printed by ``--inspect``.
 
 Prepare the baseline once (no second package installation is needed):
 
@@ -89,7 +89,7 @@ This removes the original comparison's ``ElementAssembler`` versus
 ``MixedElementAssembler`` execution/caching difference. Both paths now process
 all cells of an element type together by default; hierarchical orientation
 classes no longer imply separate integration passes. Oriented table selection,
-local-buffer packing, and CSR versus reduction projection still differ. This
+reference contraction and local-buffer packing still differ. This
 measures the hierarchical extension to mixed assembly, including those
 implementation choices. It does not introduce new coupled Stokes forms.
 
@@ -113,7 +113,7 @@ applies to the feature assembler. ``auto`` evaluates eligible value-only forms
 once per occupied orientation in the active chunk, then contracts those shared
 products with cell-specific geometry weights. Poisson and data-dependent forms
 continue to use per-cell integrands. Unit loads also benefit from reference
-sharing. Both modes use the same quadrature, cell ordering and CSR projection.
+sharing. Both modes use the same quadrature, cell ordering and reduction projection.
 
 For the latest P3/P4 mixed comparison, run:
 
@@ -251,6 +251,43 @@ matrix/load change-of-basis checks passed (scaled errors 3.30e-16/6.04e-16),
 as did polynomial-integral checks on the timed mesh. This establishes the
 largest extra CPU cost; CUDA attribution requires a separate GPU measurement.
 
+Reduction-backed whole assembly
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The hierarchical path now uses the same ``ReduceProjector`` as upstream mixed
+assembly, for both matrices and loads. Orientation is already encoded in the
+basis tables/connectivity, so projection only sums local entries with the same
+global destination. Its persistent map contains integer destination indices;
+there is no floating CSR matrix to construct, transfer or cast.
+
+Repeating the identical P4/3,072-cell command after this change measured
+**90.650 ms hierarchical versus 86.557 ms upstream**, a **4.7% gap**.
+Hierarchical Q1/Q3 were 90.022/90.951 ms. All mesh/quadrature hashes match the
+earlier run, and full matrix/load equivalence and timed-mesh numerical checks
+pass. Compared with the earlier 119.935 ms CSR run, hierarchical time decreased
+24.4%; the upstream medians remained nearly unchanged.
+
+A separate same-assembler control alternated CSR and reduction maps between
+public calls, with three warmups and 15 samples per backend. Setup and map
+switching were outside timing, and both sets of maps remained resident.
+That controlled end-to-end comparison measured **115.493 ms CSR versus
+90.864 ms reduction** (**21.3% less time**), with a median paired saving of
+24.543 ms. Matrix values were identical, and loads matched. This is a
+whole-assembly measurement, unlike the isolated projector probes above.
+
+The new matched stage medians for projection are 11.368 ms upstream and
+6.029 ms hierarchical. Contraction is now the largest positive difference:
+4.085/9.292 ms, followed by weak-form evaluation at 0.232/2.762 ms and other
+assembly at 1.508/3.878 ms. Geometry/reference preparation costs
+68.274/69.602 ms. The hierarchical trace replaces CSR ``addmm`` with
+``scatter_add_`` (4.853 ms self CPU); contraction still includes restoring
+original cell order (3.366 ms).
+
+These measurements are CPU-only. The change passes independent operator,
+mixed-block, curved-geometry, finite-difference/autograd, dtype/device and
+checkpoint tests; CUDA cases remain guarded until GPU hardware is available.
+Old CSR-layout checkpoints require rebuilding the assembler with reduction maps.
+
 Matched inputs and explicit adapters
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -358,7 +395,7 @@ A CUDA sweep, sized explicitly for the available memory, can use:
 PyTorch CPU threads. ``--batch-size`` counts quadrature points, with ``-1``
 meaning the complete rule. ``--element-batch-size`` caps original-order cells
 across orientations, with ``0`` meaning all cells of each element type. These parameters bound
-integration scratch space, not full local matrix sources or CSR metadata.
+integration scratch space, not full local matrix sources or destination indices.
 High-order mixed forms can exhaust memory even with small chunks.
 
 Forms and numerical checks
@@ -432,7 +469,7 @@ fresh-process cache benchmark.
 First public matrix/load calls are reported separately from warmed samples,
 medians and extrema. CUDA wall timers synchronize before and after each call.
 The independent stage reconstruction streams the production geometry and
-tensor kernels, packs disjoint local source slices, and applies one CSR
+tensor kernels, packs disjoint local source slices, and applies one reduction
 projection per executed block. Both matrix values/pattern and loads must match
 public assembly before a case passes. Its stages are:
 
@@ -441,7 +478,7 @@ public assembly before a case passes. Its stages are:
 * Reference-shared or per-cell weak-form evaluation.
 * Reference contraction or per-cell quadrature integration.
 * Local-buffer packing.
-* CSR projection.
+* Global reduction projection.
 * Final sparse matrix or block-vector layout.
 
 Stage timers synchronize at each boundary and therefore perturb execution.
@@ -455,7 +492,7 @@ CUDA memory is measured by a separate call after warmup. Baseline and peak
 allocated/reserved bytes, including incremental peaks, describe PyTorch's
 allocator; they are not driver memory or host RSS. The report also counts
 oriented reference storage, grouped connectivity/orientation, declared matrix/load
-CSR buffers, global values, and estimates local source, reference-gather and
+projection-index buffers, global values, and estimates local source, reference-gather and
 physical-gradient scratch sizes. Cell-batch counts are independent of the
 orientation histogram. Derived reference-contraction index storage is counted
 separately, and the reference-integration report gives eligible integrand sizes.
