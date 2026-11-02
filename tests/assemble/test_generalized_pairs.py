@@ -137,7 +137,8 @@ def _stokes_poiseuille(mesh, order_u, order_p, mu=0.7):
     lay = asm.layout
     K = asm()
     Kd = K.to_dense()
-    assert (Kd - Kd.T).abs().max() == 0.0
+    # Independently accumulated transpose entries can differ by roundoff.
+    torch.testing.assert_close(Kd, Kd.T, rtol=1e-13, atol=1e-14)
 
     xu, xp = lay.points("u"), lay.points("p")
     u_exact = torch.stack([xu[:, 1] * (1 - xu[:, 1]),
