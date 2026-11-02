@@ -9,6 +9,9 @@ to assemble these spaces. This chapter describes their mathematical and API
 contract; see :doc:`mixed_assembly` for grouped integration and chunking.
 For interpolation, evaluation and nonzero boundary lifting, see
 :doc:`hierarchical_tetrahedron_fields`.
+Single-field bilinear forms can also opt into this basis through
+``ElementAssembler.from_mesh(..., basis="hierarchical", field_order=p)``;
+see :ref:`forms-hierarchical-element` for quadrature and compatibility limits.
 
 Reference element and local layout
 ----------------------------------
