@@ -81,8 +81,8 @@ triangle quadrature supports arbitrary requested polynomial exactness degrees.
 
 Hierarchical tetrahedral fields use vertex/edge/face/cell numbering. Their
 reference tables are shared within vertex-order groups, with orientation baked
-into the edge/face functions. Matrix and load contributions use cached CSR
-projection. ``batch_size`` still chunks quadrature; ``element_batch_size`` can
+into the edge/face functions. Matrix and load contributions use cached reduction
+maps. ``batch_size`` still chunks quadrature; ``element_batch_size`` can
 independently cap original-order cells across all orientations. No per-cell
 basis evaluation is needed during assembly. Value-only reference integrands are
 shared by orientation and contracted with cell-specific geometry weights;
@@ -640,7 +640,7 @@ class MixedElementAssembler(nn.Module):
     Notes
     -----
     * Hierarchical tetrahedral fields use shared orientation table banks,
-      cell chunks spanning orientations, and CSR projection for matrices and loads.
+      cell chunks spanning orientations, and reduction projection for matrices and loads.
       Value-only forms with global scalar parameters share reference integrands
       across cells of each orientation, including on curved geometry.
       Other paths retain their existing reduction-based assembly.
@@ -947,7 +947,7 @@ class MixedElementAssembler(nn.Module):
         if tetra_topology is not None:
             grouping = GroupedTetrahedra(
                 tetra_topology, elements, cls.fields, field_conn, transformations)
-            grouping.add_vectors(cls.fields, field_n_nodes, points.dtype)
+            grouping.add_vectors(cls.fields, field_n_nodes)
 
         # ---- per-(test, trial) pair: edge pattern, scatter, expanded COO ---- #
         pair_projector: Dict[str, ReduceProjector] = {}
@@ -974,7 +974,7 @@ class MixedElementAssembler(nn.Module):
                 )
                 num_edges = edges.shape[1]
                 if grouping is not None:
-                    grouping.add_pair(beta, alpha, eids, num_edges, points.dtype)
+                    grouping.add_pair(beta, alpha, eids, num_edges)
                 else:
                     for element_type in elements:
                         n_element = elements[element_type].shape[0]
@@ -1430,7 +1430,7 @@ class MixedElementAssembler(nn.Module):
             Maximum cells per element-type chunk for hierarchical tetrahedra,
             in original mesh order across orientations. None processes all cells
             of that element type together. This bounds integration scratch
-            space, not the full local-matrix buffers or CSR projection metadata.
+            space, not the full local-matrix buffers or projection indices.
         reference_mode : {"auto", "cell"}, optional
             Hierarchical tetrahedra: ``auto`` shares value-only integrands by
             orientation when the signature contains only field values and global
