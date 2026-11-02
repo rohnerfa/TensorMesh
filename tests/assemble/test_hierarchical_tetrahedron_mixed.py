@@ -59,6 +59,33 @@ def test_all_24_classes_preserve_public_cell_order_and_match_reference():
                                atol=3e-12, rtol=3e-11)
 
 
+@pytest.mark.parametrize("element_batch_size", [None, 7])
+@pytest.mark.parametrize("form", ["mass", "poisson", "load"])
+def test_cell_chunks_span_orientations_in_one_pass_per_chunk(monkeypatch, element_batch_size, form):
+    asm = poisson(3).from_mesh(orientation_mesh())
+    mass, stiffness, load = scalar_reference(asm)
+    calls = []
+    run_pass = asm._run_pass
+
+    def counted(fn, params, alpha, beta, values, grads, data, zeros, eyes):
+        table = grads["u"] if form == "poisson" else values["u"]
+        calls.append(table.shape[:2])
+        return run_pass(fn, params, alpha, beta, values, grads, data, zeros, eyes)
+
+    monkeypatch.setattr(asm, "_run_pass", counted)
+    if form == "load":
+        actual = asm.assemble_vector(element_batch_size=element_batch_size)
+        expected = load
+    else:
+        actual = asm(func=(lambda u, v: u * v) if form == "mass" else None,
+                     element_batch_size=element_batch_size).to_dense()
+        expected = mass if form == "mass" else stiffness
+    torch.testing.assert_close(actual, expected, atol=4e-13, rtol=3e-11)
+    # 24 different orientations: default is ONE pass, not 24 one-cell passes.
+    sizes = [24] if element_batch_size is None else [7, 7, 7, 3]
+    assert calls == [(size, asm.transformation["tetra"].n_quadrature) for size in sizes]
+
+
 @pytest.mark.parametrize("p", [1, 2])
 @pytest.mark.parametrize("geometry,curved", [(1, False), (2, False), (2, True)])
 def test_supported_lagrange_change_of_basis(p, geometry, curved):
@@ -229,8 +256,8 @@ def test_invalid_element_batch_size_rejected_for_both_forms(size):
 def test_csr_source_order_and_duplicate_sums_for_matrix_and_load():
     asm = mixed_form().from_mesh(patch_mesh())
     for beta in asm.fields:
-        source_conn = torch.cat([asm.field_conn[f"{beta.trial}__{group.element_type}"][
-            asm.group_cells[group.key]].reshape(-1) for group in asm.grouping.groups])
+        source_conn = torch.cat([asm.field_conn[f"{beta.trial}__{kind}"].reshape(-1)
+                                 for kind in asm.element_types])
         projector = asm.grouping.vector_projector[beta.trial]
         assert isinstance(projector, SparseProjector)
         assert projector.projection.layout == torch.sparse_csr
@@ -251,10 +278,10 @@ def test_csr_source_order_and_duplicate_sums_for_matrix_and_load():
             source = source.reshape(size, beta.components, alpha.components) / 29
             expected = torch.zeros(asm.n_dofs, asm.n_dofs, dtype=DTYPE)
             offset = 0
-            for group in asm.grouping.groups:
-                for cell in asm.group_cells[group.key].tolist():
-                    rows = field_indices(asm, beta.trial, cell, group.element_type)
-                    cols = field_indices(asm, alpha.trial, cell, group.element_type)
+            for kind in asm.element_types:
+                for cell in range(len(asm.elements[kind])):
+                    rows = field_indices(asm, beta.trial, cell, kind)
+                    cols = field_indices(asm, alpha.trial, cell, kind)
                     nb, na = len(rows) // beta.components, len(cols) // alpha.components
                     local = source[offset:offset + nb * na].reshape(
                         nb, na, beta.components, alpha.components)
@@ -297,14 +324,15 @@ def test_registered_shared_tables_and_csr_hot_path_without_index_add(monkeypatch
     assert isinstance(asm.grouping.cells, BufferDict)
     assert isinstance(asm.grouping.pair_projector, torch.nn.ModuleDict)
     assert isinstance(asm.grouping.vector_projector, torch.nn.ModuleDict)
-    for group in asm.grouping.groups:
-        ukey = asm.grouping.table_keys[f"u__{group.key}"]
-        assert ukey == asm.grouping.table_keys[f"p__{group.key}"]
-        assert asm.grouping.ref_val[ukey].ndim == 2
-        assert asm.grouping.ref_grad[ukey].ndim == 3
-    assert len(asm.grouping.ref_val) == 2
+    ukey = asm.grouping.table_keys["u__tetra"]
+    assert ukey == asm.grouping.table_keys["p__tetra"]
+    assert asm.grouping.ref_val[ukey].shape[0] == 2
+    assert asm.grouping.ref_val[ukey].ndim == 3
+    assert asm.grouping.ref_grad[ukey].ndim == 4
+    assert len(asm.grouping.ref_val) == 1
+    torch.testing.assert_close(asm.grouping.table_index["tetra"], torch.tensor([1, 0, 1]))
     # Lagrange fields retain the existing orientation-independent cache and
-    # every group reads this same shared table.
+    # every cell chunk reads this same shared table.
     assert asm.ref_val["s__tetra"].ndim == 2
     assert [key for key in asm.ref_val if key.startswith("s__")] == ["s__tetra"]
     expected_matrix, expected_load = asm().to_dense(), asm.assemble_vector()
@@ -342,7 +370,7 @@ def test_autograd_coordinates_and_modal_coefficients_finite_differences_and_reas
 
     def objective(x, c):
         inputs = {"points": x, "field_data": {"w": ("u", c)},
-                  "batch_size": 17, "element_batch_size": 1}
+                  "batch_size": 17, "element_batch_size": 2}
         return ((asm(**inputs).to_dense() * probe).sum()
                 + (asm.assemble_vector(**inputs) * load_probe).sum())
 
@@ -394,6 +422,7 @@ def test_group_cache_state_roundtrip_and_dtype_device_movement(device):
     for table in other.grouping.ref_val.values():
         assert table.device.type == device and table.dtype == torch.float32
     for buffer in (*other.group_cells.values(), *other.cell_orientation.values(),
+                   *other.grouping.table_index.values(),
                    *other.field_conn.values()):
         assert buffer.device.type == device and buffer.dtype == torch.int64
     for projector in (*other.grouping.pair_projector.values(),
@@ -425,8 +454,8 @@ def test_grouped_setup_from_cuda_quadratic_mesh_with_hierarchical_lagrange_field
                       *gpu.grouping.vector_projector.values()):
         assert projector.projection.is_cuda
         assert projector.projection.layout == torch.sparse_csr
-    actual_matrix = gpu(batch_size=37, element_batch_size=1).to_dense()
-    actual_load = gpu.assemble_vector(batch_size=37, element_batch_size=1)
+    actual_matrix = gpu(batch_size=37, element_batch_size=2).to_dense()
+    actual_load = gpu.assemble_vector(batch_size=37, element_batch_size=2)
     assert actual_matrix.is_cuda and actual_load.is_cuda
     torch.testing.assert_close(actual_matrix.cpu(), expected_matrix, atol=4e-12, rtol=3e-10)
     torch.testing.assert_close(actual_load.cpu(), expected_load, atol=3e-13, rtol=3e-10)
