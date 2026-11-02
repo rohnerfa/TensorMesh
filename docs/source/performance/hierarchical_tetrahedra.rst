@@ -144,6 +144,113 @@ integrand has 24 rows (about 0.0274 GiB) instead of 384 (about 0.438 GiB).
 Geometry, projection, local matrices, padding and workspace also consume memory;
 the separate CUDA memory measurement reports their actual total peak.
 
+Matched matrix-stage profiling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Add ``--profile-matrix`` with ``--upstream-assembler mixed`` to diagnose the
+actual public assembly calls in both isolated checkouts. Profiling runs after
+the ordinary warmed throughput/allocator measurements and numerical checks.
+It uses the same degree-p geometry, quadrature and inputs as the comparison;
+the separate staged benchmark below uses linear geometry instead.
+
+For a longer CPU mass example (3,072 cells and one CPU thread):
+
+.. code-block:: bash
+
+   python examples/poisson/benchmark_upstream_tetrahedra.py \
+       --upstream ../TensorMesh-upstream --upstream-assembler mixed \
+       --device cpu --dtype float64 --degrees 4 --forms mass --subdivisions 8 \
+       --batch-size -1 --element-batch-size 0 --reference-mode auto \
+       --profile-matrix --threads 1 --repeats 15 --warmup 3 \
+       --output dist/tetra-mass-profile-cpu.json > dist/tetra-mass-profile-cpu.stdout.json
+
+   python examples/poisson/benchmark_upstream_tetrahedra.py \
+       --inspect dist/tetra-mass-profile-cpu.json
+
+For the earlier Euler P3/P4 sizes, use ``--device cuda --degrees 3 4
+--subdivisions 2 4`` with a distinct output filename. ``--reference-mode cell``
+profiles the earlier per-cell integrand path. Large unchunked cell-mode products
+can consume several GiB, so choose sizes that fit the selected device.
+
+The additional diagnostics are:
+
+* Exclusive synchronized wall times for input validation, recursive module
+  dtype/device conversion, signature/context preparation, geometry/reference
+  tables, form validation, weak-form evaluation, quadrature contraction, global
+  projection and sparse-pattern lookup. ``other_assembly`` contains the remaining
+  dispatch, accumulation, local packing, final sparse output and wrapper overhead.
+  The inspection table shows upstream/feature medians and their differences.
+* One annotated PyTorch operator trace per timed worker, with tensor shapes,
+  self CPU/device operator summaries and a Chrome trace JSON beside the worker
+  artifacts. This trace has no intermediate explicit CUDA synchronizations;
+  ``assembly::`` ranges identify the production stages.
+* Isolated CSR/reduction timings on the **same local contribution tensor and
+  destination map**, with numerical equivalence checks. Alternate projectors
+  are constructed outside timing and never replace the production backend.
+  These probes identify projection cost; their ratio is not a whole-assembly
+  speedup prediction.
+
+Stage synchronization and profiler instrumentation perturb execution. Use the
+original uninstrumented times for throughput, and use both the stage table and
+the operator trace for attribution. Summed stage medians need not equal the
+median instrumented total. Instrumented outputs must match ordinary assembly,
+and all temporary method wrappers are restored before each worker exits.
+
+Local CPU attribution, 2026-11-02
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On macOS arm64 with Python 3.11.18 and PyTorch 2.15.0, the command above
+measured P4 mass on 3,072 cells, 125 quadrature points, float64, one CPU thread,
+all-cell/full-quadrature batching and ``reference_mode=auto``. The original
+hierarchical CSR path took **119.935 ms**, versus **86.419 ms** upstream
+(``MixedElementAssembler``), or **38.8% longer**. These are 15 uninstrumented
+warmed samples after three warmups; setup is excluded.
+
+The upstream interquartile range was 86.216--86.655 ms (one 121.991 ms outlier);
+the hierarchical range was 118.645--123.167 ms. The separate instrumented totals
+were 85.724/119.441 ms. Exclusive stage medians were:
+
+.. list-table:: Original CSR-path diagnostics (milliseconds)
+   :header-rows: 1
+
+   * - Stage
+     - Upstream
+     - Hierarchical
+     - Difference
+   * - Geometry/reference tables
+     - 68.376
+     - 71.412
+     - +3.036
+   * - Global projection
+     - 11.216
+     - 30.577
+     - +19.361
+   * - Quadrature contraction
+     - 4.098
+     - 9.620
+     - +5.522
+   * - Weak-form evaluation
+     - 0.222
+     - 2.667
+     - +2.445
+   * - Other assembly
+     - 1.714
+     - 4.731
+     - +3.017
+
+Module dtype/device traversal totaled only 0.074/0.137 ms. The hierarchical
+operator trace attributed 27.338 ms of self CPU time to the CSR ``aten::addmm``.
+Contraction included 5.190 ms in batched multiplication and 3.783 ms restoring
+original cell order. Both paths spent substantial shared time in geometry
+determinants/inverses, which dominate absolute time but explain little of the gap.
+
+On identical hierarchical local contributions, the isolated probe took
+30.280 ms with CSR and 5.855 ms with reduction. Upstream's own inputs took
+37.960/11.421 ms respectively. These are projector-only comparisons. Full
+matrix/load change-of-basis checks passed (scaled errors 3.30e-16/6.04e-16),
+as did polynomial-integral checks on the timed mesh. This establishes the
+largest extra CPU cost; CUDA attribution requires a separate GPU measurement.
+
 Matched inputs and explicit adapters
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

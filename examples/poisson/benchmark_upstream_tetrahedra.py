@@ -25,6 +25,7 @@ import scipy
 from scipy import sparse
 
 try:
+    from ._tetrahedron_profile import profile_matrix
     from ._tetrahedron_reference_report import reference_report
     from ._tetrahedron_comparison import (
         PINNED_UPSTREAM, array_hash, expected_integrals, high_order_cube,
@@ -32,6 +33,7 @@ try:
         scaled_error, transfer_matrix,
     )
 except ImportError:  # Direct script execution.
+    from _tetrahedron_profile import profile_matrix
     from _tetrahedron_reference_report import reference_report
     from _tetrahedron_comparison import (
         PINNED_UPSTREAM, array_hash, expected_integrals, high_order_cube,
@@ -300,6 +302,10 @@ def run_worker(job, result):
             result.update(status="numerical_failure", reason="physical polynomial or basis check failed")
         else:
             result["status"] = "passed"
+            if job.get("profile_matrix") and not job["validation"]:
+                result["matrix_profile"] = profile_matrix(
+                    asm, matrix_fn, device, job["repeats"], job["warmup"],
+                    job["artifact"] + "-matrix-trace.json")
     result["imported_modules"] = assert_import_root(root)
 
 
@@ -410,7 +416,9 @@ def run(args):
                                           np.frombuffer(Path(__file__).with_name(
                                               "_tetrahedron_comparison.py").read_bytes(), dtype=np.uint8),
                                           np.frombuffer(Path(__file__).with_name(
-                                              "_tetrahedron_reference_report.py").read_bytes(), dtype=np.uint8)),
+                                              "_tetrahedron_reference_report.py").read_bytes(), dtype=np.uint8),
+                                          np.frombuffer(Path(__file__).with_name(
+                                              "_tetrahedron_profile.py").read_bytes(), dtype=np.uint8)),
               "artifacts": str(directory), "protocol": {
                   "upstream_assembler": args.upstream_assembler,
                   "forms": "scalar mass / Poisson and unit load", "geometry": "same affine Pp nodal mesh",
@@ -420,6 +428,7 @@ def run(args):
                   "upstream_element_batch_size": None,
                   "hierarchical_cell_batching": "original_order_across_orientations",
                   "hierarchical_reference_mode": args.reference_mode,
+                  "profile_matrix": args.profile_matrix,
                   "skip_cases": [{"p": p, "form": f, "subdivisions": n}
                                  for p, f, n in args.skip_case],
                   "repeats": args.repeats, "warmup": args.warmup,
@@ -472,6 +481,7 @@ def run(args):
                            "element_batch_size": (args.element_batch_size
                                                   if family == "hierarchical" else None),
                            "reference_mode": args.reference_mode if family == "hierarchical" else None,
+                           "profile_matrix": args.profile_matrix,
                            "repeats": args.repeats, "warmup": args.warmup}
                     pair[family] = launch(job, directory, index)
                     index += 1
@@ -493,6 +503,41 @@ def run(args):
     report = json_safe(report)
     write_json(output, report)
     return report
+
+
+def inspect_profiles(report, cases):
+    print("\nMatrix stage diagnostics (exclusive synchronized wall times; "
+          "instrumentation changes execution):")
+    for comparison in report["comparisons"]:
+        if comparison["status"] != "passed":
+            continue
+        key = tuple(comparison[k] for k in ("p", "form", "subdivisions", "orientation"))
+        pair = [cases[(*key, family)].get("matrix_profile")
+                for family in ("lagrange", "hierarchical")]
+        if not all(profile and profile["status"] == "passed" for profile in pair):
+            continue
+        nodal, modal = pair
+        print(f"P{key[0]} {key[1]}, {comparison['cells']} cells, {key[3]}")
+        print(f"  {'Stage':35} {'L ms':>10} {'H ms':>10} {'H-L ms':>10}")
+        deltas = []
+        for name in sorted(nodal["stages"].keys() | modal["stages"].keys()):
+            values = [profile["stages"].get(name, {}).get("median_seconds", 0) * 1000
+                      for profile in pair]
+            delta = values[1] - values[0]
+            deltas.append((delta, name))
+            print(f"  {name:35} {values[0]:10.3f} {values[1]:10.3f} {delta:+10.3f}")
+        totals = [profile["instrumented_total"]["median_seconds"] * 1000 for profile in pair]
+        print(f"  {'Instrumented total':35} {totals[0]:10.3f} {totals[1]:10.3f}")
+        delta, name = max(deltas)
+        if delta > 0:
+            print(f"  Largest positive stage delta: {name} ({delta:+.3f} ms)")
+        for family, profile in zip(("L", "H"), pair):
+            for block, probe in profile["projection_probe"].items():
+                times = probe["timings"]
+                print(f"  {family} same-input projection {block}: "
+                      f"CSR {times['csr']['median_seconds'] * 1000:.3f} ms; "
+                      f"reduce {times['reduce']['median_seconds'] * 1000:.3f} ms")
+            print(f"  {family} operator trace: {profile['operators']['trace_path']}")
 
 
 def inspect_reports(paths):
@@ -547,6 +592,8 @@ def inspect_reports(paths):
                   f"{t['lagrange_ms']:10.3f} {t['hierarchical_ms']:10.3f} "
                   f"{t['lagrange_over_hierarchical']:7.3f} "
                   f"{t['hierarchical_time_change_percent']:+9.1f}% {memory[0]:>8} {memory[1]:>8}")
+        if report["protocol"].get("profile_matrix"):
+            inspect_profiles(report, cases)
         for c in report["cases"]:
             if c["status"] != "passed":
                 print(f"  {c['family']} P{c['p']} {c['status']}: {c.get('reason', '')}; log: {c['log']}")
@@ -574,6 +621,9 @@ def main(argv=None):
     parser.add_argument("--reference-mode", choices=("auto", "cell"), default="auto",
                         help="hierarchical reference integrands: auto shares eligible value-only "
                              "forms by orientation; cell retains the previous per-cell path")
+    parser.add_argument("--profile-matrix", action="store_true",
+                        help="mixed baseline only: separate stage timings, operator traces and "
+                             "same-input CSR/reduce probes after ordinary measurements")
     parser.add_argument("--skip-case", nargs=3, action="append", default=[("6", "poisson", "4")],
                         metavar=("P", "FORM", "SUBDIVISIONS"),
                         help="exclude a timing case before launching workers; repeatable; "
@@ -592,6 +642,8 @@ def main(argv=None):
         return 0
     if args.upstream is None:
         parser.error("--upstream is required")
+    if args.profile_matrix and args.upstream_assembler != "mixed":
+        parser.error("--profile-matrix requires --upstream-assembler mixed")
     if any(p < 3 or p > 10 for p in args.degrees):
         parser.error("comparison degrees must be between 3 and 10")
     if min(args.subdivisions) < 1 or min(args.threads, args.repeats, args.warmup) < 1:

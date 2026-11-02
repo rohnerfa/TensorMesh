@@ -177,6 +177,30 @@ def test_known_p6_oom_case_is_skipped_without_starting_any_workers(tmp_path, cap
     assert "0 isolated workers" in printed
 
 
+def test_real_upstream_matrix_profiles_use_both_selected_checkouts(tmp_path, capsys):
+    report = run_isolated(tmp_path, ["--upstream-assembler", "mixed", "--degrees", "3",
+                                     "--forms", "mass", "--profile-matrix"])
+    assert report["status"] == "completed"
+    assert report["protocol"]["profile_matrix"]
+    for case in report["cases"]:
+        if case["validation"]:
+            assert "matrix_profile" not in case
+            continue
+        profile = case["matrix_profile"]
+        assert profile["output_equivalence"] == "passed"
+        assert profile["stages"]["weak_form_evaluation"]["calls_per_assembly"] == 1
+        expected = "SparseProjector" if case["family"] == "hierarchical" else "ReduceProjector"
+        assert all(probe["production_projector"] == expected
+                   for probe in profile["projection_probe"].values())
+        assert Path(profile["operators"]["trace_path"]).is_file()
+        root = Path(case["source"]["root"]) / "tensormesh"
+        assert all(Path(path).is_relative_to(root) for path in case["imported_modules"].values())
+    inspect_reports([tmp_path / "comparison.json"])
+    printed = capsys.readouterr().out
+    assert "Matrix stage diagnostics" in printed
+    assert "same-input projection" in printed
+
+
 def test_real_upstream_inaccurate_float32_p6_suppresses_ratios(tmp_path):
     report = run_isolated(tmp_path, ["--degrees", "6", "--forms", "poisson", "--dtype", "float32"],
                           expected_returncode=1)
