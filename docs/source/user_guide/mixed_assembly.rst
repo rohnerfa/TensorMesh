@@ -378,10 +378,12 @@ is available on the hierarchical tetrahedral path. ``element_data`` and field
 connectivity retain original mesh order.
 
 Completed local blocks occupy disjoint slices of an original-cell-order source buffer.
-One precomputed CSR projection per test/trial block combines them into sparse
-global values; loads use the analogous coefficient projection. This path does
-not call the older indexed matrix/load accumulation routines. Source buffers and
-CSR metadata still scale with all local basis pairs; chunking bounds integration
+One precomputed destination-index map per test/trial block combines them into
+sparse global values through ``ReduceProjector`` and ``index_add_``, as in the
+Lagrange mixed assembler. Loads use the analogous coefficient reduction.
+Orientation is already encoded in the reference tables and connectivity;
+projection sums contributions sharing a global entry. Source buffers and
+destination indices still scale with all local basis pairs; chunking bounds integration
 scratch memory, not total assembly memory. Persistent reference storage scales
 with occupied orientations, while temporary reference gathers and weak-form
 intermediates are bounded by the active cell/quadrature chunk.

@@ -1,4 +1,4 @@
-"""Orientation table banks and cell-batched CSR assembly for tetrahedral fields.
+"""Orientation table banks and cell-batched reduction for tetrahedral fields.
 
 Cell chunks span orientations in original mesh order. Orientation groups describe
 the shared reference tables, not the integration schedule.
@@ -14,7 +14,7 @@ from ..element import Tetrahedron
 from ..element.element import small_inverse
 from ..element.hierarchical_tetrahedron import TETRAHEDRON_ORIENTATIONS
 from ..nn import BufferDict
-from .projector import SparseProjector
+from .projector import ReduceProjector
 
 
 class AssemblyGroup(NamedTuple):
@@ -140,8 +140,8 @@ class GroupedTetrahedra(nn.Module):
         for kind in self.element_types:
             self.reference_chunks(kind, None)
 
-    def add_pair(self, beta, alpha, eids, n_entries, dtype):
-        """Build one CSR map from original-cell-order pairs to global entries."""
+    def add_pair(self, beta, alpha, eids, n_entries):
+        """Map each original-cell-order basis pair to its global sparse entry."""
         key = f"{beta.trial}__{alpha.trial}"
         chunks, offsets, offset = [], {}, 0
         for kind in self.element_types:
@@ -150,12 +150,12 @@ class GroupedTetrahedra(nn.Module):
             size = slots.numel()
             offsets[kind] = (offset, offset + size)
             offset += size
-        self.pair_projector[key] = SparseProjector(
-            torch.arange(offset), torch.cat(chunks), (offset,), (n_entries,), dtype=dtype)
+        self.pair_projector[key] = ReduceProjector(
+            torch.cat(chunks), (offset,), (n_entries,))
         self.pair_slices[key] = offsets
 
-    def add_vectors(self, fields, field_n_nodes, dtype):
-        """Build the corresponding CSR maps for linear forms and vector loads."""
+    def add_vectors(self, fields, field_n_nodes):
+        """Map original-cell-order load contributions to global coefficients."""
         for field in fields:
             chunks, offsets, offset = [], {}, 0
             for kind in self.element_types:
@@ -163,14 +163,13 @@ class GroupedTetrahedra(nn.Module):
                 chunks.append(conn.reshape(-1))
                 offsets[kind] = (offset, offset + conn.numel())
                 offset += conn.numel()
-            self.vector_projector[field.trial] = SparseProjector(
-                torch.arange(offset), torch.cat(chunks), (offset,),
-                (field_n_nodes[field.trial],), dtype=dtype)
+            self.vector_projector[field.trial] = ReduceProjector(
+                torch.cat(chunks), (offset,), (field_n_nodes[field.trial],))
             self.vector_slices[field.trial] = offsets
 
     def get_extra_state(self):
         """Include host-only table and projection layout in checkpoints."""
-        return {"layout": "original_cell_order_v2", "element_types": self.element_types,
+        return {"layout": "original_cell_order_reduce_v3", "element_types": self.element_types,
                 "groups": [tuple(group) for group in self.groups],
                 "table_keys": self.table_keys,
                 "pair_slices": self.pair_slices,
@@ -369,7 +368,6 @@ class GroupedTetrahedra(nn.Module):
         for alpha, beta in executed:
             key = f"{beta.trial}__{alpha.trial}" if matrix else beta.trial
             projector = self.pair_projector[key] if matrix else self.vector_projector[key]
-            projector.type(sources[key].dtype)
             projected[(alpha.trial, beta.trial) if matrix else beta.trial] = \
                 projector(sources[key])
         return projected
