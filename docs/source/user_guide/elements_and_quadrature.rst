@@ -307,13 +307,13 @@ its historical meaning depends on the shape:
 * **Lines, quads and hexes:** number of Gaussian points per direction,
   exact through degree ``2 * order - 1`` in each coordinate. There is no
   longer a seven-point limit.
-* **Tetrahedra:** requested total polynomial exactness degree. Orders 1–7
-  retain the original tables and point ordering, including negative weights
-  and boundary points. Degrees above 7 use a generated conical Gaussian
+* **Tetrahedra:** requested total polynomial exactness degree. Degrees 1–6
+  use tabulated rules, including negative weights and boundary points.
+  Degrees 7 and above use a generated conical Gaussian
   product with :math:`\lceil(d+1)/2\rceil^3` points. Generated weights are
   positive and points lie strictly inside the reference tetrahedron; the
-  rules are not symmetric or minimal-point rules. See the legacy exactness
-  note below.
+  rules are not symmetric or minimal-point rules. See the compatibility note
+  below for the corrected degree-5/6/7 rule selection.
 * **Pyramids:** points per collapsed direction. **Prisms:** triangle
   exactness degree and number of line points, preserving the mixed convention.
 
@@ -378,17 +378,14 @@ generated triangle rules above degree 7.
 
 .. note::
 
-   An analytical-moment audit of the preserved tetrahedral tables finds that
-   orders 1–4 meet their advertised degree, but orders 5, 6, and 7 are exact
-   only through degrees 4, 5, and 6, respectively. For example, the order-5
-   rule gives :math:`\int x^5 \approx 0.00295569881403488` instead of
-   :math:`1/336`, the order-6 rule gives
-   :math:`\int x^6 \approx 0.00197324377011877` instead of :math:`1/504`,
-   and the order-7 rule gives
-   :math:`\int x^7 \approx 0.00139205670790233` instead of :math:`1/720`.
-   These legacy tables are retained for numerical compatibility. Explicitly
-   request ``order >= 8`` when the missing higher moments are needed,
-   including when overriding the mixed assembler's default for such forms.
+   The old tetrahedral rules labelled 5, 6, and 7 were exact only through
+   degrees 4, 5, and 6. Rule selection is now corrected for every assembly
+   path: degree 5 uses the existing 15-point rule, degree 6 the existing
+   24-point rule, and degree 7 a generated 64-point rule. Each meets its
+   requested polynomial exactness degree. Degrees 1–4 retain their original
+   tables and point ordering. Code supplying per-quadrature-point data must
+   use the returned points/counts rather than assume the old counts
+   (14, 15, and 24) at degrees 5, 6, and 7.
 
 
 Step 5 — Reference shape values (``eval_shape_val``)

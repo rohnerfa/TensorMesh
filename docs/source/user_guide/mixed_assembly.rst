@@ -425,10 +425,10 @@ Both modes use the same cell chunks, quadrature, source layout and projection.
 Checkpoints from the earlier group-ordered or CSR-projection layouts must be
 rebuilt; their table/projection buffers differ from the current reduction layout.
 
-The tetrahedral legacy rule indices 5--7 have verified exactness 4--6. To meet an
-explicit/default exactness request, grouped assembly selects rule indices 6, 7,
-and 8 for requested degrees 5, 6, and 7, respectively. Other existing assembly
-paths retain their rule-selection behavior.
+All tetrahedral assembly paths use the requested polynomial exactness degree
+directly. Degrees 5 and 6 use the corrected 15- and 24-point tabulated rules;
+degree 7 uses a generated 64-point rule. See :doc:`elements_and_quadrature` for
+the rule-selection compatibility notes.
 
 See :doc:`hierarchical_tetrahedra` for the basis, numbering, and orientation
 contract. Modal coefficients have no interpolation-point coordinates;
