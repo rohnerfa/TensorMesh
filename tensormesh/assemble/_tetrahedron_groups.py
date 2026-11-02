@@ -4,6 +4,7 @@ Cell chunks span orientations in original mesh order. Orientation groups describ
 the shared reference tables, not the integration schedule.
 """
 
+from collections import defaultdict
 from typing import NamedTuple, Tuple
 
 import torch
@@ -24,6 +25,66 @@ class AssemblyGroup(NamedTuple):
     class_id: int
     orientation: Tuple[int, int, int, int]
     n_cells: int
+
+
+class _ReferenceBucket(nn.Module):
+    """A batched contraction of similarly sized orientation populations."""
+
+    def __init__(self, cells, first, last):
+        super().__init__()
+        self.first, self.last = first, last
+        self.register_buffer("cells", cells, persistent=False)
+
+
+class _ReferenceChunk(nn.Module):
+    """Nonpersistent integer packing for one original-order cell chunk.
+
+    Round each orientation population up to a power of two and batch equal
+    widths together. Padding is less than twice the cell count even for skewed
+    populations. Only weights and integrated local blocks use the padded layout;
+    quadrature integrands retain one row per occupied orientation.
+    """
+
+    def __init__(self, table_ids):
+        super().__init__()
+        by_orientation, by_width = defaultdict(list), defaultdict(list)
+        for cell, orientation in enumerate(table_ids):
+            by_orientation[orientation].append(cell)
+        for orientation, cells in sorted(by_orientation.items()):
+            width = 1 << (len(cells) - 1).bit_length()
+            by_width[width].append((orientation, cells))
+        orientations, buckets = [], []
+        restore = torch.empty(len(table_ids), dtype=torch.long)
+        offset = 0
+        for width, entries in sorted(by_width.items()):
+            packed = torch.empty(len(entries), width, dtype=torch.long)
+            first = len(orientations)
+            for row, (orientation, cells) in enumerate(entries):
+                orientations.append(orientation)
+                # Padding repeats a valid cell; padded results are discarded.
+                packed[row].fill_(cells[0])
+                packed[row, :len(cells)] = torch.tensor(cells)
+                restore[cells] = offset + row * width + torch.arange(len(cells))
+            buckets.append(_ReferenceBucket(packed, first, len(orientations)))
+            offset += packed.numel()
+        self.n_cells = len(table_ids)
+        self.n_orientations = len(orientations)
+        self.padded_cells = offset
+        self.buckets = nn.ModuleList(buckets)
+        self.register_buffer("orientations", torch.tensor(orientations), persistent=False)
+        self.register_buffer("restore", restore, persistent=False)
+
+    def values(self, bank, qs, qe):
+        values = bank[:, qs:qe].index_select(0, self.orientations)
+        return values[0] if self.n_orientations == 1 else values
+
+    def contract(self, integrand, jxw):
+        """[O,Q,...] × packed cell weights -> [E,...], without [E,Q,...]."""
+        products = integrand.flatten(2)
+        blocks = [torch.bmm(jxw[bucket.cells], products[bucket.first:bucket.last])
+                  .flatten(0, 1) for bucket in self.buckets]
+        packed = blocks[0] if len(blocks) == 1 else torch.cat(blocks)
+        return packed[self.restore].reshape(self.n_cells, *integrand.shape[2:])
 
 
 class GroupedTetrahedra(nn.Module):
@@ -74,6 +135,10 @@ class GroupedTetrahedra(nn.Module):
         self.vector_projector = nn.ModuleDict()
         self.pair_slices = {}
         self.vector_slices = {}
+        self.reference_plans = nn.ModuleDict()
+        # The common all-cell schedule is prepared on CPU during construction.
+        for kind in self.element_types:
+            self.reference_chunks(kind, None)
 
     def add_pair(self, beta, alpha, eids, n_entries, dtype):
         """Build one CSR map from original-cell-order pairs to global entries."""
@@ -116,6 +181,28 @@ class GroupedTetrahedra(nn.Module):
         # must fail rather than silently assigning a table to the wrong class.
         if state != self.get_extra_state():
             raise RuntimeError("grouped tetrahedral checkpoint has a different assembly layout")
+        # Schedules are derived from the loaded integer buffers, never serialized.
+        self.reference_plans.clear()
+
+    def reference_chunks(self, kind, element_batch_size):
+        """Cache integer schedules; new cell limits have a one-time host setup."""
+        ids = self.table_index[kind]
+        step = min(element_batch_size or len(ids), len(ids))
+        key = f"{kind}__e{step}"
+        if key not in self.reference_plans:
+            host_ids = ids.detach().cpu().tolist()
+            self.reference_plans[key] = nn.ModuleList([
+                _ReferenceChunk(host_ids[start:start + step])
+                for start in range(0, len(host_ids), step)]).to(ids.device)
+        return self.reference_plans[key]
+
+    @staticmethod
+    def shares_reference(params, reference_mode="auto"):
+        """Only reference values and global scalar arguments can share products."""
+        if reference_mode not in ("auto", "cell"):
+            raise ValueError("reference_mode must be 'auto' or 'cell'")
+        return reference_mode == "auto" and all(
+            role in ("trial_val", "test_val", "scalar") for _, role, _ in params)
 
     @staticmethod
     def validate_batches(batch_size, element_batch_size):
@@ -129,14 +216,16 @@ class GroupedTetrahedra(nn.Module):
             raise ValueError("element_batch_size must be None or a positive cell count")
 
     def batches(self, asm, params, point_data, element_data, scalar_data, field_data,
-                needs_val, needs_grad, batch_size, element_batch_size):
+                needs_val, needs_grad, batch_size, element_batch_size, reference_mode="auto"):
         """Yield original-order cell/quadrature chunks spanning all orientations.
 
-        No polynomial evaluation, topology discovery, or device scalar reads
-        occur here. Per-cell reference gathers are limited to the active chunk;
-        persistent tables are shared by orientation and polynomial degree.
+        Eligible value-only forms retain an orientation axis through weak-form
+        evaluation; other forms gather per-cell tables. Integer packing schedules
+        for new cell limits are cached on first use. Warmed batches perform no
+        polynomial evaluation, topology discovery, or device scalar reads.
         """
         self.validate_batches(batch_size, element_batch_size)
+        share_reference = self.shares_reference(params, reference_mode)
         point_keys = [k for k, kind, _ in params if kind == "point"]
         gradpoint_keys = [k for k, kind, _ in params if kind == "gradpoint"]
         field_keys = [k for k, kind, _ in params if kind == "fielddata"]
@@ -147,8 +236,10 @@ class GroupedTetrahedra(nn.Module):
             qstep = nq if batch_size in (-1, None) else batch_size
             n_cells = len(self.elements[kind])
             estep = n_cells if element_batch_size is None else element_batch_size
+            plans = self.reference_chunks(kind, element_batch_size) if share_reference else None
             for start in range(0, n_cells, estep):
                 stop = min(start + estep, n_cells)
+                plan = plans[start // estep] if plans is not None else None
                 table_ids = self.table_index[kind][start:stop]
                 geom_conn = self.elements[kind][start:stop]
                 coords = trans.points[geom_conn]
@@ -177,8 +268,11 @@ class GroupedTetrahedra(nn.Module):
                             if name in needs_val:
                                 key = (table_key, "value")
                                 if key not in gathered:
-                                    gathered[key] = (val[0, qs:qe] if val.shape[0] == 1 else
-                                                     val[:, qs:qe][table_ids])
+                                    if plan is not None:
+                                        gathered[key] = plan.values(val, qs, qe)
+                                    else:
+                                        gathered[key] = (val[0, qs:qe] if val.shape[0] == 1 else
+                                                         val[:, qs:qe][table_ids])
                                 tables_val[name] = gathered[key]
                             if name in needs_grad:
                                 key = (table_key, "gradient")
@@ -226,18 +320,26 @@ class GroupedTetrahedra(nn.Module):
                         elif data_kind == "scalar":
                             data_args[key] = scalar_data[key]
                     yield (kind, start, stop, qe == nq, jxw,
-                           tables_val, tables_grad, data_args)
+                           tables_val, tables_grad, data_args, plan)
+
+    @staticmethod
+    def contract(asm, integrand, jxw, has_batch, reference_plan):
+        """The leading vmap axis is orientation for shared forms, cell otherwise."""
+        if reference_plan is not None and has_batch:
+            return reference_plan.contract(integrand, jxw)
+        return asm._integrate_pair(integrand, jxw, has_batch)
 
     def integrate(self, asm, fn, params, executed, zeros, eyes_by_field,
                   point_data, element_data, scalar_data, field_data,
-                  needs_val, needs_grad, batch_size, element_batch_size, *, matrix):
+                  needs_val, needs_grad, batch_size, element_batch_size, *, matrix,
+                  reference_mode="auto"):
         """Integrate into disjoint source slices, then project once per block."""
         self.validate_batches(batch_size, element_batch_size)
         sources, acc = {}, {}
         checked = False
-        for kind, start, stop, last_q, jxw, values, grads, data in self.batches(
+        for kind, start, stop, last_q, jxw, values, grads, data, plan in self.batches(
                 asm, params, point_data, element_data, scalar_data, field_data,
-                needs_val, needs_grad, batch_size, element_batch_size):
+                needs_val, needs_grad, batch_size, element_batch_size, reference_mode):
             if not checked:
                 asm._check_bilinear(fn, params, data, asm.dtype, asm.device,
                                     form="bilinear" if matrix else "linear")
@@ -248,7 +350,7 @@ class GroupedTetrahedra(nn.Module):
                         "test": eyes_by_field.get(beta.trial)}
                 out, has_e = asm._run_pass(
                     fn, params, alpha, beta, values, grads, data, zeros, eyes)
-                local = asm._integrate_pair(out, jxw, has_e)
+                local = self.contract(asm, out, jxw, has_e, plan)
                 del out
                 acc[key] = local if key not in acc else acc[key] + local
                 if not last_q:

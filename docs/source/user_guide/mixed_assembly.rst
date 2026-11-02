@@ -348,6 +348,8 @@ number of occupied orientations; geometry stays nodal. Cell chunks span
 orientations in original mesh order and select the corresponding reference
 tables on the device. Equal-degree hierarchical fields share both the banks
 and active-chunk gathers. Lagrange fields reuse orientation-independent tables.
+By default, eligible value-only forms evaluate their reference integrands once
+per occupied orientation in the active chunk.
 
 The same weak-form interface applies. ``batch_size`` counts quadrature points;
 the optional ``element_batch_size`` independently limits cells across orientations:
@@ -382,10 +384,41 @@ not call the older indexed matrix/load accumulation routines. Source buffers and
 CSR metadata still scale with all local basis pairs; chunking bounds integration
 scratch memory, not total assembly memory. Persistent reference storage scales
 with occupied orientations, while temporary reference gathers and weak-form
-intermediates scale with the active cell/quadrature chunk. Value-only forms can
-now carry a cell axis when orientations differ; unchunked mass assembly may
-therefore use more scratch than the previous per-orientation execution.
+intermediates are bounded by the active cell/quadrature chunk.
 GPU speedups depend on degree, chunk sizes, hardware, and form, and must be measured.
+
+Sharing reference integrands
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``reference_mode="auto"`` (the default on both matrix and load calls) shares
+integrands whose signatures contain only field values and global ``scalar_data``
+parameters. This includes scalar/vector mass matrices, rectangular value-only
+couplings and constant-coefficient loads. It uses the supplied ``forward`` or
+``func``; it does not recognize forms by name or replace them with a hardcoded
+mass formula.
+
+For each active cell/quadrature chunk, weak-form evaluation produces
+``[O,Q,test,trial,...]`` rather than ``[E,Q,test,trial,...]``. Geometry weights
+remain ``[E,Q]``. Orientations with similar cell counts are contracted together
+using batched matrix multiplication, and results are restored to original cell
+order. Power-of-two population buckets bound the padded weight/local-block
+layout to fewer than twice the active cells, even for skewed distributions.
+A balanced population needs one batched contraction across all orientations.
+No cell-sized quadrature/basis-pair product is created by this path.
+
+This works with curved geometry: the geometry weights may vary at every
+quadrature point. Integrands are recomputed on every assembly call, so changed
+global parameters and their autograd graphs are respected. Only integer packing
+schedules are cached. The all-cell schedule is constructed during setup;
+additional cell limits have one-time schedule setup during the first call.
+These derived integer buffers move with the module and are rebuilt after
+loading a checkpoint.
+
+Signatures requesting physical gradients, coordinates, point/element data or
+``field_data`` retain per-cell evaluation. Selection is conservative even if an
+argument is unused inside the function. ``reference_mode="cell"`` explicitly
+selects the previous per-cell evaluation for numerical and performance comparisons.
+Both modes use the same cell chunks, quadrature, source layout and projection.
 
 Checkpoints from the earlier group-ordered assembly layout must be rebuilt;
 their reference-table and projection-buffer layouts differ from this version.

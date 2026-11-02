@@ -35,6 +35,11 @@ from tensormesh.assemble._tetrahedron_groups import GroupedTetrahedra
 from tensormesh.element import Tetrahedron
 from tensormesh.sparse import SparseMatrix
 
+try:
+    from ._tetrahedron_reference_report import reference_report
+except ImportError:
+    from _tetrahedron_reference_report import reference_report
+
 
 FORMS = ("mass", "poisson", "mixed", "field_data")
 ORIENTATIONS = tuple(itertools.permutations(range(4)))
@@ -278,7 +283,8 @@ def data_for(asm, form, shift=0.0):
     return {"rho": ("u", affine_coefficients(asm, "u", constant=shift, axis=0))}
 
 
-def reconstruct(asm, matrix=True, batch_size=16, element_batch_size=None, field_data=None):
+def reconstruct(asm, matrix=True, batch_size=16, element_batch_size=None, field_data=None,
+                reference_mode="auto"):
     """Stream geometry, kernels, packing and CSR projection independently.
 
     Returns
@@ -307,7 +313,8 @@ def reconstruct(asm, matrix=True, batch_size=16, element_batch_size=None, field_
     projectors = grouping.pair_projector if matrix else grouping.vector_projector
     slices = grouping.pair_slices if matrix else grouping.vector_slices
     batches = iter(grouping.batches(asm, params, points, {}, {}, field_data,
-                                   needs_val, needs_grad, batch_size, element_batch_size))
+                                   needs_val, needs_grad, batch_size, element_batch_size,
+                                   reference_mode))
     seconds = defaultdict(float)
     sources, accumulated = {}, {}
     checked = False
@@ -316,7 +323,7 @@ def reconstruct(asm, matrix=True, batch_size=16, element_batch_size=None, field_
         seconds["geometry_data_and_physical_gradients"] += elapsed
         if batch is None:
             break
-        kind, start, stop, last_q, jxw, val, grad, data = batch
+        kind, start, stop, last_q, jxw, val, grad, data, plan = batch
         if not checked:
             _, elapsed = timed_call(lambda: asm._check_bilinear(
                 fn, params, data, asm.dtype, asm.device,
@@ -326,17 +333,25 @@ def reconstruct(asm, matrix=True, batch_size=16, element_batch_size=None, field_
         for alpha, beta in executed:
             key = f"{beta.trial}__{alpha.trial}" if matrix else beta.trial
 
-            def integrate():
+            def evaluate():
                 out, has_e = asm._run_pass(
                     fn, params, alpha, beta, val, grad, data, zeros,
                     {"trial": eyes.get(alpha.trial) if matrix else None,
                      "test": eyes.get(beta.trial)})
-                contribution = asm._integrate_pair(out, jxw, has_e)
+                return out, has_e
+
+            (out, has_e), elapsed = timed_call(evaluate, asm.device)
+            seconds["reference_form_evaluation" if plan is not None else
+                    "cell_form_evaluation"] += elapsed
+
+            def integrate():
+                contribution = grouping.contract(asm, out, jxw, has_e, plan)
                 return (accumulated[key] + contribution if key in accumulated
                         else contribution)
 
             accumulated[key], elapsed = timed_call(integrate, asm.device)
-            seconds["weak_form_and_quadrature"] += elapsed
+            seconds["reference_contraction" if plan is not None else "cell_quadrature"] += elapsed
+            del out
             if not last_q:
                 continue
 
@@ -474,6 +489,8 @@ def storage_report(asm, batch_size, element_batch_size):
             "grouped_connectivity_and_orientation_bytes": connectivity_bytes,
             "physical_gradient_scratch_upper_estimate_bytes": largest_gradients,
             "reference_gather_scratch_upper_estimate_bytes": largest_reference_gather,
+            "reference_contraction_index_bytes": sum(t.numel() * t.element_size()
+                                                     for t in grouping.reference_plans.buffers()),
             "cell_batches_per_quadrature_sweep": cell_batches,
             "reference_tables_have_no_element_axis": all(t.ndim == 3 for t in grouping.ref_val.values())
             and all(t.ndim == 4 for t in grouping.ref_grad.values())}
@@ -512,7 +529,8 @@ def optional_solve(asm, matrix, load, device, repeats, warmup):
 
 
 def benchmark_case(mesh, p, form, family, device, repeats, warmup, batch_size,
-                   element_batch_size, quadrature_order, quadrature_extra, solve):
+                   element_batch_size, quadrature_order, quadrature_extra, solve,
+                   reference_mode="auto"):
     degree = quadrature_order or max(2 * p, 3 if form == "field_data" else 1) + quadrature_extra
     actual_rule = degree + 1 if degree in (5, 6, 7) else degree
     # Legacy Lagrange dispatch does not promote defective rule indices 5--7.
@@ -521,6 +539,7 @@ def benchmark_case(mesh, p, form, family, device, repeats, warmup, batch_size,
     chunks = {"batch_size": batch_size}
     if asm.grouped_tetrahedra:
         chunks["element_batch_size"] = element_batch_size
+        chunks["reference_mode"] = reference_mode
     fields = data_for(asm, form)
     matrix_fn = lambda: asm(field_data=fields, **chunks)
     load_fn = lambda: asm.assemble_vector(field_data=fields, **chunks)
@@ -587,6 +606,11 @@ def benchmark_case(mesh, p, form, family, device, repeats, warmup, batch_size,
             "batch_size": batch_size, "element_batch_size": chunks.get("element_batch_size"),
             "cell_batching": ("original_order_across_orientations" if asm.grouped_tetrahedra
                               else "all_cells_per_element_type"),
+            "reference_integration": {
+                name: reference_report(asm, fn, matrix, batch_size, element_batch_size,
+                                       reference_mode, fields)
+                for name, fn, matrix in (("matrix", asm.forward, True),
+                                        ("load", asm.forward_vector, False))},
             "quadrature": quadrature, "orientation_group_histogram": histogram,
             "executed_blocks": [f"{b.trial}__{a.trial}"
                                 for a, b in asm._executed_pairs(asm.fields, params)],
@@ -599,7 +623,8 @@ def benchmark_case(mesh, p, form, family, device, repeats, warmup, batch_size,
 def run_benchmark(degrees=(1, 2, 3, 4, 6), subdivisions=(1,), forms=FORMS,
                   orientations=("balanced",), device="cpu", dtype="float64", repeats=3,
                   warmup=1, batch_size=16, element_batch_size=32, quadrature_order=None,
-                  quadrature_extra=0, threads=1, compare_lagrange=False, solve=False):
+                  quadrature_extra=0, threads=1, compare_lagrange=False, solve=False,
+                  reference_mode="auto"):
     """Return a JSON-compatible report; unsupported hardware is explicit."""
     if (not degrees or any(isinstance(p, bool) or not isinstance(p, int) or p < 1 for p in degrees)
             or not subdivisions or any(n < 1 for n in subdivisions)
@@ -609,6 +634,7 @@ def run_benchmark(degrees=(1, 2, 3, 4, 6), subdivisions=(1,), forms=FORMS,
             or (quadrature_order is not None and quadrature_order < 1)):
         raise ValueError("invalid benchmark configuration")
     GroupedTetrahedra.validate_batches(batch_size, element_batch_size)
+    GroupedTetrahedra.shares_reference([], reference_mode)
     if dtype not in ("float32", "float64"):
         raise ValueError("dtype must be float32 or float64")
     device = torch.device(device)
@@ -616,6 +642,7 @@ def run_benchmark(degrees=(1, 2, 3, 4, 6), subdivisions=(1,), forms=FORMS,
         raise ValueError("benchmark supports CPU and CUDA")
     root = Path(__file__).resolve().parents[2]
     sources = ["examples/poisson/benchmark_hierarchical_tetrahedra.py",
+               "examples/poisson/_tetrahedron_reference_report.py",
                "tensormesh/assemble/_tetrahedron_groups.py", "tensormesh/assemble/mixed_assembler.py",
                "tensormesh/assemble/topology.py", "tensormesh/assemble/projector.py",
                "tensormesh/element/hierarchical_tetrahedron.py", "tensormesh/element/quadrature.py"]
@@ -625,6 +652,7 @@ def run_benchmark(degrees=(1, 2, 3, 4, 6), subdivisions=(1,), forms=FORMS,
         "orientations": list(orientations), "device": str(device), "dtype": dtype,
         "repeats": repeats, "warmup": warmup, "threads": threads, "batch_size": batch_size,
         "element_batch_size": element_batch_size, "quadrature_order": quadrature_order,
+        "reference_mode": reference_mode,
         "quadrature_extra": quadrature_extra, "compare_lagrange": compare_lagrange,
         "solve": solve, "autograd_enabled": False}, "environment": {
             "platform": platform.platform(), "processor": platform.processor(),
@@ -672,7 +700,7 @@ def run_benchmark(degrees=(1, 2, 3, 4, 6), subdivisions=(1,), forms=FORMS,
                     try:
                         case = benchmark_case(mesh, p, form, family, device, repeats, warmup,
                                               batch_size, element_batch_size, quadrature_order,
-                                              quadrature_extra, solve)
+                                              quadrature_extra, solve, reference_mode)
                     except (torch.cuda.OutOfMemoryError, MemoryError) as exc:
                         case = {"status": "out_of_memory", "reason": str(exc)}
                     except (AssertionError, RuntimeError) as exc:
@@ -709,6 +737,8 @@ def main(argv=None):
     parser.add_argument("--batch-size", type=int, default=16, help="quadrature points; -1 = all")
     parser.add_argument("--element-batch-size", type=int, default=32,
                         help="cells across orientations; 0 = all cells of each element type")
+    parser.add_argument("--reference-mode", choices=("auto", "cell"), default="auto",
+                        help="auto shares eligible integrands by orientation; cell disables sharing")
     parser.add_argument("--quadrature-order", type=int)
     parser.add_argument("--quadrature-extra", type=int, default=0)
     parser.add_argument("--compare-lagrange", action="store_true")

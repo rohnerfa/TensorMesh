@@ -98,11 +98,51 @@ implementation choices. It does not introduce new coupled Stokes forms.
 cell limit, so upstream always uses all cells and the report explicitly labels
 the hierarchical-only limit. For matched cell scheduling use ``0``; for matched
 quadrature chunking use the same ``--batch-size`` supplied to both paths. Unlike
-the earlier orientation-group schedule, unchunked high-order mass assembly can
-materialize cell-dependent integrands and consume more GPU scratch memory.
+the earlier per-cell value path, the default reference-sharing mode avoids
+materializing mass integrands separately for every cell.
 
 Pass several explicit report filenames to ``--inspect`` to display both
 baseline comparisons; each table identifies its upstream assembler.
+
+Orientation-shared reference products
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Both benchmark drivers accept ``--reference-mode auto`` (the default) and
+``--reference-mode cell`` (the preceding per-cell implementation). The option
+applies to the feature assembler. ``auto`` evaluates eligible value-only forms
+once per occupied orientation in the active chunk, then contracts those shared
+products with cell-specific geometry weights. Poisson and data-dependent forms
+continue to use per-cell integrands. Unit loads also benefit from reference
+sharing. Both modes use the same quadrature, cell ordering and CSR projection.
+
+For the latest P3/P4 mixed comparison, run:
+
+.. code-block:: bash
+
+   python examples/poisson/benchmark_upstream_tetrahedra.py \
+       --upstream ../TensorMesh-upstream --upstream-assembler mixed \
+       --device cuda --dtype float64 --degrees 3 4 \
+       --forms mass poisson --subdivisions 2 4 \
+       --batch-size -1 --element-batch-size 0 --reference-mode auto \
+       --repeats 7 --warmup 2 --output dist/tetra-reference-shared-gpu.json \
+       > dist/tetra-reference-shared-gpu.stdout.json
+
+   python examples/poisson/benchmark_upstream_tetrahedra.py \
+       --inspect dist/tetra-reference-shared-gpu.json
+
+Repeat with ``--reference-mode cell`` and a distinct output filename for a
+controlled comparison against the preceding feature path. The new mode is
+printed by ``--inspect``; older reports remain readable. The default P6/384-cell
+Poisson exclusion continues to apply if P6 is included in the degree sweep.
+
+JSON records the selected reference strategy separately for matrices and loads,
+the maximum final reference-integrand size per chunk and its cell-mode
+counterpart, plus orientation/bucket/padding counts for eligible forms. These
+are tensor-size estimates, **not measured peak allocations**. For P4 mass with
+384 cells, 125 quadrature points and 24 balanced orientations, the shared
+integrand has 24 rows (about 0.0274 GiB) instead of 384 (about 0.438 GiB).
+Geometry, projection, local matrices, padding and workspace also consume memory;
+the separate CUDA memory measurement reports their actual total peak.
 
 Matched inputs and explicit adapters
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -290,7 +330,9 @@ projection per executed block. Both matrix values/pattern and loads must match
 public assembly before a case passes. Its stages are:
 
 * Geometry/data gathering and physical-gradient mapping.
-* Form validation and weak-form evaluation/quadrature integration.
+* Form validation.
+* Reference-shared or per-cell weak-form evaluation.
+* Reference contraction or per-cell quadrature integration.
 * Local-buffer packing.
 * CSR projection.
 * Final sparse matrix or block-vector layout.
@@ -308,7 +350,9 @@ allocator; they are not driver memory or host RSS. The report also counts
 oriented reference storage, grouped connectivity/orientation, declared matrix/load
 CSR buffers, global values, and estimates local source, reference-gather and
 physical-gradient scratch sizes. Cell-batch counts are independent of the
-orientation histogram. These estimates omit
+orientation histogram. Derived reference-contraction index storage is counted
+separately, and the reference-integration report gives eligible integrand sizes.
+The scratch estimates omit
 weak-form intermediates and allocator overhead. CPU runs mark GPU memory as
 unavailable. Requests for unavailable CUDA emit a machine-readable unavailable
 report and return a nonzero exit status. Catchable allocation failures receive

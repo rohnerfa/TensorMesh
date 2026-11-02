@@ -25,12 +25,14 @@ import scipy
 from scipy import sparse
 
 try:
+    from ._tetrahedron_reference_report import reference_report
     from ._tetrahedron_comparison import (
         PINNED_UPSTREAM, array_hash, expected_integrals, high_order_cube,
         install_input_adapters, modal_probes, polynomial_probes, quadrature,
         scaled_error, transfer_matrix,
     )
 except ImportError:  # Direct script execution.
+    from _tetrahedron_reference_report import reference_report
     from _tetrahedron_comparison import (
         PINNED_UPSTREAM, array_hash, expected_integrals, high_order_cube,
         install_input_adapters, modal_probes, polynomial_probes, quadrature,
@@ -225,6 +227,7 @@ def run_worker(job, result):
         chunks = {"batch_size": job["batch_size"]}
         if hierarchical:
             chunks["element_batch_size"] = job.get("element_batch_size")
+            chunks["reference_mode"] = job.get("reference_mode", "auto")
         matrix_fn = lambda: asm(**chunks)
         load_fn = (lambda: asm.assemble_vector(**chunks)) if load_asm is None \
             else (lambda: load_asm(batch_size=job["batch_size"]))
@@ -245,6 +248,13 @@ def run_worker(job, result):
                                                 job["warmup"], first_matrix),
                 "full_load_assembly": measure(load_fn, device, job["repeats"],
                                               job["warmup"], first_load)}
+
+        if hierarchical:
+            result["reference_integration"] = {
+                name: reference_report(asm, fn, matrix, job["batch_size"],
+                                       job.get("element_batch_size"), chunks["reference_mode"])
+                for name, fn, matrix in (("matrix", asm.forward, True),
+                                        ("load", asm.forward_vector, False))}
 
         # Verify actual installed nodes/rule, including dtype conversion and dispatch.
         actual_nodes = Tetrahedron.get_basis(p, dtype, device)
@@ -360,6 +370,7 @@ def timing_pair(nodal, modal, validation):
     result = {k: modal[k] for k in ("p", "form", "subdivisions", "orientation")}
     result["upstream_assembler"] = nodal.get("upstream_assembler", "element")
     result["hierarchical_element_batch_size"] = modal.get("element_batch_size")
+    result["hierarchical_reference_mode"] = modal.get("reference_mode", "cell")
     result["cells"] = 6 * result["subdivisions"]**3
     result["status"] = "not_comparable"
     result["worker_status"] = {"lagrange": nodal["status"], "hierarchical": modal["status"]}
@@ -397,7 +408,9 @@ def run(args):
     report = {"schema_version": 1, "status": "running", "upstream": upstream, "feature": feature,
               "driver_sha256": array_hash(np.frombuffer(Path(__file__).read_bytes(), dtype=np.uint8),
                                           np.frombuffer(Path(__file__).with_name(
-                                              "_tetrahedron_comparison.py").read_bytes(), dtype=np.uint8)),
+                                              "_tetrahedron_comparison.py").read_bytes(), dtype=np.uint8),
+                                          np.frombuffer(Path(__file__).with_name(
+                                              "_tetrahedron_reference_report.py").read_bytes(), dtype=np.uint8)),
               "artifacts": str(directory), "protocol": {
                   "upstream_assembler": args.upstream_assembler,
                   "forms": "scalar mass / Poisson and unit load", "geometry": "same affine Pp nodal mesh",
@@ -406,6 +419,7 @@ def run(args):
                   "hierarchical_element_batch_size": args.element_batch_size,
                   "upstream_element_batch_size": None,
                   "hierarchical_cell_batching": "original_order_across_orientations",
+                  "hierarchical_reference_mode": args.reference_mode,
                   "skip_cases": [{"p": p, "form": f, "subdivisions": n}
                                  for p, f, n in args.skip_case],
                   "repeats": args.repeats, "warmup": args.warmup,
@@ -457,6 +471,7 @@ def run(args):
                            "batch_size": args.batch_size,
                            "element_batch_size": (args.element_batch_size
                                                   if family == "hierarchical" else None),
+                           "reference_mode": args.reference_mode if family == "hierarchical" else None,
                            "repeats": args.repeats, "warmup": args.warmup}
                     pair[family] = launch(job, directory, index)
                     index += 1
@@ -496,6 +511,11 @@ def inspect_reports(paths):
         if cell_batched:
             limit = report["protocol"]["hierarchical_element_batch_size"]
             print(f"Cell chunks: L all cells; H {limit or 'all cells'}, spanning orientations")
+        if "hierarchical_reference_mode" in report["protocol"]:
+            mode = report["protocol"]["hierarchical_reference_mode"]
+            print(f"H reference mode: {mode}; " + (
+                "eligible value-only integrands shared by orientation" if mode == "auto" else
+                "per-cell integrands (sharing disabled)"))
         repeats = report["protocol"].get("repeats")
         if repeats is not None:
             print(f"Each time is the median of {repeats} warmed matrix calls; "
@@ -551,6 +571,9 @@ def main(argv=None):
     parser.add_argument("--element-batch-size", type=int, default=0,
                         help="hierarchical-only cell chunk across orientations; 0 means all cells "
                              "(upstream always processes all cells)")
+    parser.add_argument("--reference-mode", choices=("auto", "cell"), default="auto",
+                        help="hierarchical reference integrands: auto shares eligible value-only "
+                             "forms by orientation; cell retains the previous per-cell path")
     parser.add_argument("--skip-case", nargs=3, action="append", default=[("6", "poisson", "4")],
                         metavar=("P", "FORM", "SUBDIVISIONS"),
                         help="exclude a timing case before launching workers; repeatable; "

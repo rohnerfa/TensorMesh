@@ -86,6 +86,7 @@ def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys,
     assert report["protocol"]["upstream_assembler"] == upstream_assembler
     assert report["protocol"]["hierarchical_element_batch_size"] is None
     assert report["protocol"]["hierarchical_cell_batching"] == "original_order_across_orientations"
+    assert report["protocol"]["hierarchical_reference_mode"] == "auto"
     assert report["wall_seconds"] > 0
     assert report["status"] == "completed"
     assert len(report["validation"]) == len(report["comparisons"]) == 6
@@ -102,6 +103,11 @@ def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys,
         assert case["worker_wall_seconds"] > 0
         if case["family"] == "lagrange":
             assert case["assembly_api"].startswith(expected)
+        else:
+            references = case["reference_integration"]
+            assert references["matrix"]["strategy"] == (
+                "orientation_shared" if case["form"] == "mass" else "cellwise")
+            assert references["load"]["strategy"] == "orientation_shared"
         root = Path(case["source"]["root"]) / "tensormesh"
         assert all(Path(path).is_relative_to(root) for path in case["imported_modules"].values())
         assert case["source"]["root"] == report[
@@ -111,6 +117,7 @@ def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys,
     assert "H change" in printed
     assert f"L: upstream {expected}" in printed
     assert "Cell chunks: L all cells; H all cells, spanning orientations" in printed
+    assert "H reference mode: auto" in printed
     assert "median of 1 warmed matrix calls" in printed
     assert all(c["upstream_assembler"] == upstream_assembler for c in report["comparisons"])
     pair = {c["family"]: c for c in report["cases"] if not c["validation"]
@@ -124,16 +131,35 @@ def test_real_upstream_p3_p4_p6_operators_and_import_isolation(tmp_path, capsys,
 
 @pytest.mark.parametrize("upstream_assembler", ["element", "mixed"])
 def test_real_upstream_p5_chunked_quadrature_and_single_orientation(tmp_path, upstream_assembler):
-    report = run_isolated(tmp_path, ["--degrees", "5", "--forms", "poisson", "--batch-size", "17",
+    report = run_isolated(tmp_path, ["--degrees", "5", "--forms", "mass", "poisson", "--batch-size", "17",
                                      "--element-batch-size", "5",
                                      "--orientations", "balanced", "single",
                                      "--upstream-assembler", upstream_assembler])
-    assert report["validation"][0]["passed"]
-    assert len(report["comparisons"]) == 2
+    assert all(check["passed"] for check in report["validation"])
+    assert len(report["comparisons"]) == 4
     for case in report["cases"]:
         assert case["batch_size"] == 17
         assert case["element_batch_size"] == (5 if case["family"] == "hierarchical" else None)
         assert case["numerical"]["passed"]
+
+
+@pytest.mark.parametrize("reference_mode", ["auto", "cell"])
+def test_real_upstream_mass_reports_shared_and_cellwise_integrand_storage(tmp_path, reference_mode):
+    report = run_isolated(tmp_path, ["--upstream-assembler", "mixed", "--degrees", "4",
+                                     "--forms", "mass", "--subdivisions", "2",
+                                     "--batch-size", "17", "--element-batch-size", "37",
+                                     "--reference-mode", reference_mode])
+    assert report["protocol"]["hierarchical_reference_mode"] == reference_mode
+    assert report["comparisons"][0]["hierarchical_reference_mode"] == reference_mode
+    assert report["validation"][0]["passed"]
+    for case in report["cases"]:
+        if case["family"] != "hierarchical":
+            continue
+        reference = case["reference_integration"]["matrix"]
+        assert reference["eligible"]
+        sizes = reference["element_types"]["tetra35"]
+        assert sizes["max_integrand_bytes"] == (24 if reference_mode == "auto" else 37) * 17 * 35**2 * 8
+        assert sizes["cell_mode_max_integrand_bytes"] == 37 * 17 * 35**2 * 8
 
 
 def test_known_p6_oom_case_is_skipped_without_starting_any_workers(tmp_path, capsys):

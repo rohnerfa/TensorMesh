@@ -39,11 +39,13 @@ def test_generated_cube_has_unit_volume_and_conforming_interior_faces(orientatio
 
 
 @pytest.mark.parametrize("form", ["mass", "poisson", "mixed", "field_data"])
-def test_stage_reconstruction_matches_chunked_public_assembly_and_analytic_cube(form):
+@pytest.mark.parametrize("reference_mode", ["auto", "cell"])
+def test_stage_reconstruction_matches_chunked_public_assembly_and_analytic_cube(form, reference_mode):
     mesh = cube_mesh(1)
     asm = assembler_class(2, form).from_mesh(mesh)
     field_data = data_for(asm, form, 0.5)
-    kwargs = {"field_data": field_data, "batch_size": 3, "element_batch_size": 4}
+    kwargs = {"field_data": field_data, "batch_size": 3, "element_batch_size": 4,
+              "reference_mode": reference_mode}
     with torch.no_grad():
         matrix = asm(**kwargs)
         load = asm.assemble_vector(**kwargs)
@@ -55,8 +57,12 @@ def test_stage_reconstruction_matches_chunked_public_assembly_and_analytic_cube(
         torch.testing.assert_close(vector, load, atol=2e-12, rtol=2e-12)
         assert numerical_diagnostics(asm, matrix, load, form, 0.5)["passed"]
     for stages in (matrix_stages, vector_stages):
-        assert {"geometry_data_and_physical_gradients", "weak_form_and_quadrature",
-                "local_buffer_packing", "csr_projection"} <= stages.keys()
+        assert {"geometry_data_and_physical_gradients", "local_buffer_packing",
+                "csr_projection"} <= stages.keys()
+        assert {"reference_form_evaluation", "cell_form_evaluation"} & stages.keys()
+        assert {"reference_contraction", "cell_quadrature"} & stages.keys()
+    shared_matrix = reference_mode == "auto" and form == "mass"
+    assert ("reference_contraction" in matrix_stages) == shared_matrix
 
 
 def test_p4_face_and_cell_modes_reconstruct_with_promoted_quadrature():
@@ -87,6 +93,8 @@ def test_report_has_analytic_checks_reassembly_and_same_rule_lagrange_comparison
         assert modal["storage"]["reference_tables_have_no_element_axis"]
         assert modal["cell_batching"] == "original_order_across_orientations"
         assert modal["storage"]["cell_batches_per_quadrature_sweep"] == {"tetra": 6}
+        strategy = "orientation_shared" if modal["form"] == "mass" else "cellwise"
+        assert modal["reference_integration"]["matrix"]["strategy"] == strategy
         assert "oriented_reference_tabulation" in modal["setup"]["exclusive_cpu_stages_seconds"]
         for case in (modal, nodal):
             assert case["numerical"]["passed"]

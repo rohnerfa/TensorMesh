@@ -84,7 +84,9 @@ reference tables are shared within vertex-order groups, with orientation baked
 into the edge/face functions. Matrix and load contributions use cached CSR
 projection. ``batch_size`` still chunks quadrature; ``element_batch_size`` can
 independently cap original-order cells across all orientations. No per-cell
-basis evaluation is needed during assembly.
+basis evaluation is needed during assembly. Value-only reference integrands are
+shared by orientation and contracted with cell-specific geometry weights;
+``reference_mode="cell"`` selects per-cell integrands for comparison.
 """
 import inspect
 import math
@@ -639,6 +641,8 @@ class MixedElementAssembler(nn.Module):
     -----
     * Hierarchical tetrahedral fields use shared orientation table banks,
       cell chunks spanning orientations, and CSR projection for matrices and loads.
+      Value-only forms with global scalar parameters share reference integrands
+      across cells of each orientation, including on curved geometry.
       Other paths retain their existing reduction-based assembly.
     * ``energy`` / ``from_assembler`` are not provided for mixed forms.
     * Load vectors are assembled space-aware by :meth:`assemble_vector`
@@ -1130,7 +1134,7 @@ class MixedElementAssembler(nn.Module):
 
         def add_field_arg(side, kind, f, table, basis_ax, comp_ax):
             grad = kind.endswith("grad")
-            if grad or table.ndim == 3:  # physical gradients or per-cell values
+            if grad or table.ndim == 3:  # gradients or cell/orientation-batched values
                 k = add_raw(table, {AX_E: 0, AX_Q: 0, basis_ax: 0})
             else:
                 k = add_raw(table, {AX_Q: 0, basis_ax: 0})
@@ -1411,7 +1415,7 @@ class MixedElementAssembler(nn.Module):
                  scalar_data: Optional[Mapping[str, torch.Tensor]] = None,
                  batch_size: int = -1,
                  field_data: Optional[Mapping[str, Tuple[str, torch.Tensor]]] = None,
-                 *, element_batch_size: Optional[int] = None
+                 *, element_batch_size: Optional[int] = None, reference_mode: str = "auto"
                  ) -> SparseMatrix:
         r"""Assemble the mixed bilinear form into the global block sparse matrix.
 
@@ -1427,6 +1431,12 @@ class MixedElementAssembler(nn.Module):
             in original mesh order across orientations. None processes all cells
             of that element type together. This bounds integration scratch
             space, not the full local-matrix buffers or CSR projection metadata.
+        reference_mode : {"auto", "cell"}, optional
+            Hierarchical tetrahedra: ``auto`` shares value-only integrands by
+            orientation when the signature contains only field values and global
+            scalar parameters. ``cell`` uses per-cell evaluation for comparison.
+            Forms using gradients or cell-dependent data always use per-cell
+            evaluation. Geometry weights remain cell-dependent in both modes.
         field_data : Mapping[str, Tuple[str, torch.Tensor]], optional
             Data living on a *field's* DOFs rather than on mesh points:
             ``{"w": ("u", values)}`` with ``values`` of shape
@@ -1447,6 +1457,8 @@ class MixedElementAssembler(nn.Module):
             self._normalize_inputs(points, point_data, element_data, scalar_data, field_data)
         if element_batch_size is not None and not self.grouped_tetrahedra:
             raise ValueError("element_batch_size is supported for grouped tetrahedral fields")
+        if reference_mode != "auto" and not self.grouped_tetrahedra:
+            raise ValueError("reference_mode is supported for grouped tetrahedral fields")
         dtype, device = points.dtype, points.device
 
         fn = self.forward if func is None else func
@@ -1459,7 +1471,8 @@ class MixedElementAssembler(nn.Module):
             pass_vals = self.grouping.integrate(
                 self, fn, params, executed, zeros, eyes_by_field,
                 point_data, element_data, scalar_data, field_data,
-                needs_val, needs_grad, batch_size, element_batch_size, matrix=True)
+                needs_val, needs_grad, batch_size, element_batch_size, matrix=True,
+                reference_mode=reference_mode)
         else:
             acc: Dict[Tuple[str, str, str], Optional[torch.Tensor]] = {}
             checked_bilinear = False
@@ -1534,7 +1547,7 @@ class MixedElementAssembler(nn.Module):
                         scalar_data: Optional[Mapping[str, torch.Tensor]] = None,
                         batch_size: int = -1,
                         field_data: Optional[Mapping[str, Tuple[str, torch.Tensor]]] = None,
-                        *, element_batch_size: Optional[int] = None
+                        *, element_batch_size: Optional[int] = None, reference_mode: str = "auto"
                         ) -> torch.Tensor:
         r"""Assemble a **linear** form into the global block load vector.
 
@@ -1557,6 +1570,8 @@ class MixedElementAssembler(nn.Module):
         ``element_batch_size`` independently limits original-order cells across
         orientations, with None processing all cells of each element type,
         as in ``assembler(...)``.
+        ``reference_mode="auto"`` shares eligible value-only integrands by
+        orientation; ``"cell"`` retains per-cell evaluation, as for matrices.
 
         Returns
         -------
@@ -1568,6 +1583,8 @@ class MixedElementAssembler(nn.Module):
             self._normalize_inputs(points, point_data, element_data, scalar_data, field_data)
         if element_batch_size is not None and not self.grouped_tetrahedra:
             raise ValueError("element_batch_size is supported for grouped tetrahedral fields")
+        if reference_mode != "auto" and not self.grouped_tetrahedra:
+            raise ValueError("reference_mode is supported for grouped tetrahedral fields")
         dtype, device = points.dtype, points.device
 
         fn = self.forward_vector if func is None else func
@@ -1592,7 +1609,8 @@ class MixedElementAssembler(nn.Module):
             projected = self.grouping.integrate(
                 self, fn, params, [(None, beta) for beta in executed], zeros, eyes_by_field,
                 point_data, element_data, scalar_data, field_data,
-                needs_val, needs_grad, batch_size, element_batch_size, matrix=False)
+                needs_val, needs_grad, batch_size, element_batch_size, matrix=False,
+                reference_mode=reference_mode)
             return torch.cat([
                 projected[f.trial].reshape(-1) if f.trial in projected else
                 points.new_zeros(self.field_n_nodes[f.trial] * f.components)
