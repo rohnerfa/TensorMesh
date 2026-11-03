@@ -81,6 +81,7 @@ triangle quadrature supports arbitrary requested polynomial exactness degrees.
 """
 import inspect
 import math
+from numbers import Integral
 from typing import Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
@@ -762,13 +763,13 @@ class MixedElementAssembler(nn.Module):
             Source mesh; its element order defines the geometry order,
             independently of field orders.
         quadrature_order : int, optional
-            Triangle polynomial exactness degree. Defaults to
+            Triangle/tetrahedron polynomial exactness degree. Defaults to
             ``2 * max(field.order)``, sufficient for constant-coefficient
-            mass/stiffness products on affine triangles. Higher-degree
+            mass/stiffness products on affine simplices. Higher-degree
             coefficients, nonlinear forms and curved geometry may require
             an explicit larger value and quadrature-convergence checks.
-            Other shapes retain their existing rule conventions (e.g. line/
-            tensor-product orders count points; tetrahedra have tables 1..7).
+            Line/tensor-product orders count Gaussian points per direction;
+            prism order specifies both triangle degree and line point count.
         *args, **kwargs
             Additional arguments forwarded to ``__post_init__``.
         """
@@ -791,9 +792,9 @@ class MixedElementAssembler(nn.Module):
         mesh_order = next(iter(orders.values()))
         if quadrature_order is None:
             quadrature_order = 2 * max(f.order for f in cls.fields)
-        # Rule capability is shape-specific; triangle rules are generated
-        # above degree 7, while unsupported shapes validate in their factory.
-        if (isinstance(quadrature_order, bool) or not isinstance(quadrature_order, int)
+        # Rule conventions are shape-specific; each factory supplies generated
+        # rules when the requested order exceeds its legacy tables.
+        if (isinstance(quadrature_order, bool) or not isinstance(quadrature_order, Integral)
                 or quadrature_order < 1):
             raise ValueError("quadrature_order must be an integer >= 1")
 
