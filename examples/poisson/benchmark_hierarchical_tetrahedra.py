@@ -530,10 +530,8 @@ def benchmark_case(mesh, p, form, family, device, repeats, warmup, batch_size,
                    element_batch_size, quadrature_order, quadrature_extra, solve,
                    reference_mode="auto"):
     degree = quadrature_order or max(2 * p, 3 if form == "field_data" else 1) + quadrature_extra
-    actual_rule = degree + 1 if degree in (5, 6, 7) else degree
-    # Legacy Lagrange dispatch does not promote defective rule indices 5--7.
-    request = degree if family == "hierarchical" else actual_rule
-    asm, setup = construct(mesh, p, form, family, request, device)
+    # Corrected quadrature dispatch honors the requested degree for both bases.
+    asm, setup = construct(mesh, p, form, family, degree, device)
     chunks = {"batch_size": batch_size}
     if asm.grouped_tetrahedra:
         chunks["element_batch_size"] = element_batch_size
@@ -592,7 +590,7 @@ def benchmark_case(mesh, p, form, family, device, repeats, warmup, batch_size,
         digest = hashlib.sha256(weights.detach().cpu().numpy().tobytes()
                                 + points.detach().cpu().numpy().tobytes()).hexdigest()
         quadrature[kind] = {"requested_exactness_degree": degree,
-                            "assembler_request": request,
+                            "assembler_request": degree,
                             "actual_rule_index": transformation.quadrature_order,
                             "points": transformation.n_quadrature, "sha256": digest}
     histogram = ({str(g.class_id): g.n_cells for g in asm.grouping.groups}

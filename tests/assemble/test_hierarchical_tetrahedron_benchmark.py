@@ -65,9 +65,9 @@ def test_stage_reconstruction_matches_chunked_public_assembly_and_analytic_cube(
     assert ("reference_contraction" in matrix_stages) == shared_matrix
 
 
-def test_p4_face_and_cell_modes_reconstruct_with_promoted_quadrature():
+def test_p4_face_and_cell_modes_reconstruct_with_requested_quadrature():
     asm = assembler_class(4, "poisson").from_mesh(cube_mesh(1, "skewed"), quadrature_order=6)
-    assert asm.transformation["tetra"].quadrature_order == 7
+    assert asm.transformation["tetra"].quadrature_order == 6
     with torch.no_grad():
         matrix = asm(batch_size=5, element_batch_size=2)
         result, _ = reconstruct(asm, batch_size=5, element_batch_size=2)
@@ -86,7 +86,7 @@ def test_report_has_analytic_checks_reassembly_and_same_rule_lagrange_comparison
     for modal, nodal in zip(report["cases"][::2], report["cases"][1::2]):
         rule = modal["quadrature"]["tetra"]
         assert rule["requested_exactness_degree"] == 5
-        assert rule["actual_rule_index"] == 6
+        assert rule["actual_rule_index"] == 5
         assert rule["sha256"] == nodal["quadrature"]["tetra"]["sha256"]
         assert modal["reconstruction"]["matrix_and_load_match_public_assembly"]
         assert sum(modal["orientation_group_histogram"].values()) == 6
