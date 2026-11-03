@@ -238,6 +238,13 @@ def test_layout_helpers(p2_mesh):
 # --------------------------------------------------------------------- #
 # 7. validation errors
 # --------------------------------------------------------------------- #
+@pytest.mark.parametrize("order", [np.int32(4), np.int64(8)])
+def test_numpy_integer_quadrature_orders(p1_mesh, order):
+    actual = ScalarMassMixed.from_mesh(p1_mesh, quadrature_order=order)
+    expected = ScalarMassMixed.from_mesh(p1_mesh, quadrature_order=int(order))
+    torch.testing.assert_close(_dense(actual()), _dense(expected()), rtol=0, atol=0)
+
+
 def test_validation_errors(p2_mesh, p1_mesh):
     with pytest.raises(ValueError):  # trial == test
         Field(trial="u", test="u")
