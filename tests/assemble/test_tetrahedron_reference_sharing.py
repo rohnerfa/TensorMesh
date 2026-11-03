@@ -146,19 +146,18 @@ def test_reference_plans_are_rebuilt_after_checkpoint_and_move_with_module():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_cuda_shared_reference_mass_reduces_peak_scratch():
-    from examples.poisson.benchmark_hierarchical_tetrahedra import assembler_class, cube_mesh
-
-    asm = assembler_class(4, "mass").from_mesh(cube_mesh(3)).cuda()
+    asm = poisson(4).from_mesh(orientation_mesh(list(range(24)) * 7)).cuda()
+    mass = lambda u, v: u * v
     with torch.no_grad():
-        shared = asm().values.cpu()
-        cell = asm(reference_mode="cell").values.cpu()
+        shared = asm(func=mass).values.cpu()
+        cell = asm(func=mass, reference_mode="cell").values.cpu()
         torch.testing.assert_close(shared, cell, atol=3e-13, rtol=3e-11)
         peaks = {}
         for mode in ("auto", "cell"):
             torch.cuda.synchronize()
             baseline = torch.cuda.memory_allocated()
             torch.cuda.reset_peak_memory_stats()
-            result = asm(reference_mode=mode)
+            result = asm(func=mass, reference_mode=mode)
             torch.cuda.synchronize()
             peaks[mode] = torch.cuda.max_memory_allocated() - baseline
             del result

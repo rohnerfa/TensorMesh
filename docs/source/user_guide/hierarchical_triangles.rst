@@ -179,11 +179,3 @@ assembly/evaluation tests are guarded when no CUDA device is available.
 Reference values/gradients and orientation buffers follow module device
 and dtype conversions. Physical inversion and high-order float64 work
 require backend support; MPS does not support float64.
-
-The runnable examples ``examples/poisson/compare_hierarchical.py`` and
-``examples/poisson/benchmark_hierarchical.py`` compare matched Lagrange and
-hierarchical spaces. Benchmark setup, tabulation, integration, orientation,
-projection and solve timings are separate; accuracy/conditioning are not
-inferred from throughput. GPU recurrence tabulation can be slower because
-of many small kernel launches. Solver comparisons depend on backend,
-stopping tolerances and coefficient scaling, not just basis tabulation.

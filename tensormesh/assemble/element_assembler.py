@@ -9,7 +9,7 @@ import torch.nn as nn
 from .projector import ReduceProjector, SparseProjector, Projector
 from .topology import build_edges
 from ..nn import BufferDict
-from ..element import element_type2dimension, Transformation
+from ..element import element_type2dimension, element_type2order, Transformation
 from ..sparse import SparseMatrix
 from ..mesh import Mesh
 from ..vmap import vmap
@@ -166,7 +166,8 @@ class ElementAssembler(nn.Module):
         ``(row, col)`` index pairs of the assembled sparse matrix; produced
         by deduplicating all per-element basis-pair indices.
     n_points : int
-        Number of mesh points (size of one matrix dimension).
+        Number of geometry mesh points. For hierarchical fields the matrix
+        dimension is the number of modal coefficients, not this count.
     dimension : int
         Spatial dimension of the mesh, one of ``1``, ``2``, ``3``.
     element_types : list[str]
@@ -201,6 +202,7 @@ class ElementAssembler(nn.Module):
                         elements:BufferDict,
                         edges:torch.Tensor,
                         *args,
+                        _hierarchical=None,
                         **kwargs):
         super().__init__()
         element_types = list(projector.keys())
@@ -213,6 +215,8 @@ class ElementAssembler(nn.Module):
         self.dimension          = dimension
         self.element_types      = list(elements.keys())
         self.n_points           = next(iter(self.transformation.values())).n_points # type: ignore
+        self._hierarchical      = _hierarchical
+        self._matrix_size       = self.n_points if _hierarchical is None else _hierarchical.n_dofs
         self._block_edges_cache = {}  # block_size -> (row, col) flat indices
         self.__post_init__(*args,**kwargs)
 
@@ -302,7 +306,10 @@ class ElementAssembler(nn.Module):
             COO sparse matrix; block-COO if ``integral`` is 3D (vector problems).
         """
         if integral.dim() == 1:
-            return SparseMatrix(integral, self.edges[0], self.edges[1], shape=(self.n_points, self.n_points))
+            return SparseMatrix(
+                integral, self.edges[0], self.edges[1],
+                shape=(self._matrix_size, self._matrix_size),
+            )
         elif integral.dim() ==  3:
             block_size = integral.shape[1]
             assert integral.shape[2] == block_size, (
@@ -311,7 +318,7 @@ class ElementAssembler(nn.Module):
             row, col = self._block_edges(block_size)
             return SparseMatrix(
                 integral.flatten(), row, col,
-                shape=(self.n_points * block_size, self.n_points * block_size),
+                shape=(self._matrix_size * block_size, self._matrix_size * block_size),
             )
         else:
             raise Exception(f"the shape of integral is supposed to be  1D or 3D, but got {integral.shape}")
@@ -365,8 +372,10 @@ class ElementAssembler(nn.Module):
             Sparse matrix of shape :math:`[|\mathcal V|, |\mathcal V|]`, or
             block sparse of shape :math:`[|\mathcal V| \times H, |\mathcal V| \times H]`
             with :math:`H` degrees of freedom per node (inferred from the
-            rank of the ``forward`` return).
+            rank of the ``forward`` return). For hierarchical fields, replace
+            :math:`|\mathcal V|` with the scalar modal coefficient count.
         """
+        hierarchical = self._hierarchical is not None
         assert isinstance(point_data, dict) or point_data is None, f"point_data should be a dict, but got {type(point_data)}. Please pass  in extra parameter using key-value pairs"
         # make sure point data is Dict[str, torch.Tensor]
         if point_data is None:
@@ -392,7 +401,8 @@ class ElementAssembler(nn.Module):
         if scalar_data is None:
             scalar_data = {}
         else:
-            scalar_data = {k:torch.tensor(v) for k,v in scalar_data.items()}
+            scalar_data = {k:(torch.as_tensor(v) if hierarchical else torch.tensor(v))
+                           for k,v in scalar_data.items()}
 
         quadrature_data = normalize_quadrature_data(
             quadrature_data, self.transformation, # type:ignore
@@ -411,6 +421,8 @@ class ElementAssembler(nn.Module):
         point_data["x"] = points # type:ignore [n_point, n_dim]
 
         self = self.type(points.dtype).to(points.device) # type:ignore
+        if hierarchical:
+            scalar_data = {k:v.to(points.device) for k,v in scalar_data.items()}
 
         for key, value in point_data.items():
             assert value.shape[0] == points.shape[0], f"the shape of {key} should be [n_point, ...], but got {value.shape}"
@@ -422,8 +434,8 @@ class ElementAssembler(nn.Module):
         signature = inspect.signature(fn)
 
         broadcast_fns = [
-            (lambda x: x=="u"     , InputBroadcast(False, True, True,  False)), # [:        , n_quadrature, n_u_basis,         :]
-            (lambda x: x=="v"     , InputBroadcast(False, True, False,  True)), # [:        , n_quadrature,         :, n_v_basis]
+            (lambda x: x=="u"     , InputBroadcast(hierarchical, True, True,  False)),
+            (lambda x: x=="v"     , InputBroadcast(hierarchical, True, False,  True)),
             (lambda x: x=="gradu" , InputBroadcast(True,  True, True,  False)), # [n_element, n_quadrature, n_u_basis,         :, n_dim]
             (lambda x: x=="gradv" , InputBroadcast(True,  True, False,  True)), # [n_element, n_quadrature,         :, n_v_basis, n_dim]
             (lambda x: x in element_data.keys(),
@@ -431,7 +443,8 @@ class ElementAssembler(nn.Module):
             (lambda x: x in quadrature_data,
                                     InputBroadcast(True, True,  False, False)), # [n_element, n_quadrature,        :,         :]
             (lambda x: x in scalar_data.keys(),
-                                    InputBroadcast(True, True,  True,  True )),
+                                    InputBroadcast(not hierarchical, not hierarchical,
+                                                   not hierarchical, not hierarchical)),
             (lambda x: x in point_data.keys(),
                                     InputBroadcast(True, True,  False, False)),  # [n_element, n_quadrature,        :,         :]
             (lambda x: x in {"grad" + key for key in point_data.keys()},
@@ -508,13 +521,24 @@ class ElementAssembler(nn.Module):
                 n_batch      = math.ceil(n_quadrature / batch_size)
             elements:torch.Tensor = self.elements[element_type]
             ele_point_data = {k:v[elements] for k,v in point_data.items()}
+            field = self._hierarchical.blocks[element_type] if hierarchical else None
 
             for i in range(n_batch):
                 # prepare arguments
-                shape_val            = trans.batch_shape_val(i*n_batch_size, n_batch_size) 
-                shape_grad, jxw      = trans.batch_shape_grad_jxw(
+                if hierarchical:
+                    shape_val, shape_grad, jxw, inverse = field.batch(
+                        trans, i*n_batch_size, n_batch_size)
+                    # point_data (including x) always belongs to nodal geometry.
+                    nodal_val = trans.batch_shape_val(i*n_batch_size, n_batch_size)
+                    nodal_grad = None
+                    n_basis = field.conn.shape[1]
+                else:
+                    shape_val = trans.batch_shape_val(i*n_batch_size, n_batch_size)
+                    shape_grad, jxw = trans.batch_shape_grad_jxw(
                                                 quadrature_start = i*n_batch_size, 
                                                 quadrature_batch = n_batch_size)
+                    nodal_val, nodal_grad = shape_val, shape_grad
+                    n_basis = trans.n_basis
                 # shape_val : [quadrature_batch, n_basis]
                 # shape_grad: [element_batch, quadrature_batch, n_basis, dim]
                 # jxw       : [element_batch, quadrature_batch]
@@ -528,14 +552,18 @@ class ElementAssembler(nn.Module):
                     elif key in ele_point_data:
                         # Promote real ``shape_val`` to match complex
                         # coefficients — einsum doesn't auto-promote.
-                        sv = shape_val
+                        sv = nodal_val
                         if ele_point_data[key].is_complex() and not sv.is_complex():
                             sv = sv.to(ele_point_data[key].dtype)
                         args.append(torch.einsum("eb...,qb->eq...",ele_point_data[key], sv))
                         # point data : [element_batch, quadrature_batch, ...]
                     elif key.startswith("grad") and key[4:] in ele_point_data: # grad point data
                         coeff = ele_point_data[key[4:]]
-                        sg = shape_grad
+                        if nodal_grad is None:
+                            start = i*n_batch_size
+                            nodal_grad = torch.einsum("qib,eqji->eqbj",
+                                field.geom_grad[start:start+n_batch_size], inverse)
+                        sg = nodal_grad
                         if coeff.is_complex() and not sg.is_complex():
                             sg = sg.to(coeff.dtype)
                         args.append(torch.einsum("eb...,eqbd->eq...d", coeff, sg))
@@ -554,7 +582,7 @@ class ElementAssembler(nn.Module):
                 batch_integral = parallel_fn(*args) # [n_element, batch_size, n_basis, n_basis, ...] or [n_batch, batch_size, n_basis, ...]
 
 
-                batch_integral = self._integrate(batch_integral, jxw, trans.n_elements, trans.n_basis, use_element_parallel)
+                batch_integral = self._integrate(batch_integral, jxw, trans.n_elements, n_basis, use_element_parallel)
 
                 element_integral = batch_integral if element_integral is None else element_integral + batch_integral
             
@@ -660,6 +688,10 @@ class ElementAssembler(nn.Module):
             F_int = u.grad
             
         """
+        if self._hierarchical is not None:
+            raise NotImplementedError(
+                "hierarchical ElementAssembler currently supports bilinear assembly, not energy()"
+            )
         assert isinstance(point_data, dict) or point_data is None, f"point_data should be a dict"
         if point_data is None: point_data = {}
         if element_data is None: element_data = {element_type:{} for element_type in self.element_types}
@@ -850,9 +882,8 @@ class ElementAssembler(nn.Module):
         Returns
         -------
         torch.Tensor
-            Either a 2D tensor of shape ``[B, B]`` (scalar problems) or a 4D
-            tensor of shape ``[B, B, H, H]`` (vector problems with ``H``
-            degrees of freedom per node).
+            A scalar (shape ``[]``) or a component block ``[H, H]``. The
+            assembler's vmap layers generate the basis-pair axes ``[B, B]``.
         """
         raise NotImplementedError("forward is not implemented")
         
@@ -897,18 +928,22 @@ class ElementAssembler(nn.Module):
             A new assembler sharing the same mesh.
         """
         assert isinstance(obj, ElementAssembler), f"obj must be an instance of ElementAssembler, but got {type(obj)}"
+        if obj._hierarchical is not None:
+            kwargs["_hierarchical"] = obj._hierarchical
         return cls(
                    obj.projector, 
                    obj.transformation,
                    obj.elements,
                    obj.edges,
-                   *args,**kwargs)
+                   *args, **kwargs)
 
     @classmethod
     def from_mesh(cls, mesh:Mesh,
                         quadrature_order:int = 2,
                         project:str = 'reduce',
                         *args,
+                        basis:str = "lagrange",
+                        field_order:Optional[int] = None,
                         **kwargs):
         r"""Build an :class:`ElementAssembler` from a :class:`~tensormesh.Mesh`.
 
@@ -923,6 +958,14 @@ class ElementAssembler(nn.Module):
             Positive integer; defaults to ``2``.
         project : {'reduce', 'sparse'}, optional
             Backend used for the element-to-edge scatter; defaults to ``'reduce'``.
+        basis : {'lagrange', 'hierarchical'}
+            Keyword-only field basis family. The default leaves existing nodal assembly
+            unchanged. Hierarchical fields currently support tetrahedra and
+            bilinear matrix assembly only; geometry remains nodal.
+        field_order : int, optional
+            Keyword-only field degree, defaulting to the mesh degree. A different degree is
+            currently supported only with ``basis='hierarchical'``. Quadrature
+            still defaults to degree 2: choose it explicitly for higher orders.
         *args, **kwargs
             Additional arguments forwarded to ``__post_init__``.
 
@@ -933,12 +976,34 @@ class ElementAssembler(nn.Module):
         """
 
         assert project in ['reduce', 'sparse']
+        if basis not in ("lagrange", "hierarchical"):
+            raise ValueError("basis must be 'lagrange' or 'hierarchical'")
+        if field_order is not None and (isinstance(field_order, bool)
+                or not isinstance(field_order, int) or field_order < 1):
+            raise ValueError("field_order must be an integer >= 1")
 
         points:torch.Tensor   = mesh.points # type: ignore
         elements              = mesh.elements() # type:ignore
         n_points:int          = points.shape[0]
         if isinstance(elements, torch.Tensor):
             elements = {mesh.default_element_type: elements}
+
+        mapping = None
+        field_elements = elements
+        orders = {element_type2order[kind] for kind in elements}
+        if basis == "hierarchical":
+            from .topology import hierarchical_tetrahedron_dofmap
+            if field_order is None:
+                if len(orders) != 1:
+                    raise ValueError("field_order is required for mixed geometry degrees")
+                field_order = next(iter(orders))
+            if hasattr(cls, "update_state"):
+                raise NotImplementedError("hierarchical material state updates are not supported")
+            mapping = hierarchical_tetrahedron_dofmap(elements, n_points, field_order)
+            field_elements = mapping.conn
+        elif field_order is not None and orders != {field_order}:
+            raise ValueError("a different field_order requires basis='hierarchical'")
+        n_dofs = n_points if mapping is None else mapping.n_dofs
 
         projector          = {}
         transformations    = {}
@@ -948,13 +1013,13 @@ class ElementAssembler(nn.Module):
         # compute the edges
         ######################
         edges, elem_eids = build_edges(
-            {element_type: (value, value) for element_type, value in elements.items()},
-            shape=(n_points, n_points),
+            {element_type: (value, value) for element_type, value in field_elements.items()},
+            shape=(n_dofs, n_dofs),
         )
         num_edges = edges.shape[1]
 
         for element_type, value in elements.items():
-            n_element, n_basis = value.shape
+            n_element, n_basis = field_elements[element_type].shape
 
             if project == "reduce":
                 projector[element_type] = ReduceProjector( # [n_element, n_basis, n_basis] -> [num_edges]
@@ -964,7 +1029,8 @@ class ElementAssembler(nn.Module):
                                         )
             elif project == "sparse":
                 projector[element_type] = SparseProjector( # [n_element, n_basis, n_basis] -> [num_edges]
-                                            from_  = torch.arange(elem_eids[element_type].numel(), device=points.device),
+                                            from_  = torch.arange(elem_eids[element_type].numel(), device=(
+                                                points.device if mapping is None else elem_eids[element_type].device)),
                                             to_    = elem_eids[element_type],
                                             from_shape = (n_element, n_basis, n_basis),
                                             to_shape = (num_edges,),
@@ -983,6 +1049,9 @@ class ElementAssembler(nn.Module):
         projector          = nn.ModuleDict(projector)
         transformations    = nn.ModuleDict(transformations)
         elements           = BufferDict({k:v.long() for k,v in elements.items()})
+        if mapping is not None:
+            from ._hierarchical_element import _HierarchicalElement
+            kwargs["_hierarchical"] = _HierarchicalElement(mapping, transformations, field_order)
     
 
         assembler = cls(
@@ -990,7 +1059,7 @@ class ElementAssembler(nn.Module):
                    transformations,
                    elements,
                    edges,
-                   *args,**kwargs)
+                   *args, **kwargs)
         assembler = assembler.type(mesh.dtype).to(mesh.device)
         return assembler
       

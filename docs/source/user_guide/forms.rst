@@ -152,6 +152,70 @@ and call ``from_mesh(...)`` + ``()``. Calling the assembler returns a
 That's the whole user story for a scalar bilinear form: one ``forward``
 method, three lines of glue, sparse matrix in hand.
 
+.. _forms-hierarchical-element:
+
+Opt-in hierarchical tetrahedral fields
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Existing nodal calls are unchanged. To select the hierarchical tetrahedral
+basis while keeping the same ``forward`` contract, pass the keyword-only
+``basis="hierarchical"`` to ``from_mesh``:
+
+.. code-block:: python
+
+   from tensormesh import LinearElasticityElementAssembler
+
+   assembler = LinearElasticityElementAssembler.from_mesh(
+       mesh, basis="hierarchical", field_order=3, quadrature_order=4,
+       E=210e9, nu=0.3,
+   )
+   K = assembler()
+
+``field_order`` defaults to the mesh's degree; an explicit hierarchical degree
+is independent of geometry degree. Geometry remains nodal, including on curved
+meshes. ``basis="lagrange"`` is the default; changing the degree of a Lagrange
+field independently of geometry is not supported by this constructor.
+The names ``basis`` and ``field_order`` are now reserved constructor options,
+rather than parameters forwarded to a subclass's ``__post_init__``.
+
+The integrand still receives scalar basis values and gradients ``[D]`` and
+returns a scalar or an entire ``[H,H]`` component block. No rewrite of existing
+mass, Laplace or elasticity ``forward`` methods is needed. ``from_assembler``
+preserves the selected basis, degree, coefficient numbering and shared caches.
+
+.. important::
+
+   The existing quadrature default is still **2**, not an automatic function
+   of field degree. Choose quadrature explicitly: on affine tetrahedra,
+   constant-coefficient stiffness needs degree ``2*p-2`` and mass needs
+   ``2*p``. Curved geometry and variable coefficients require additional care.
+
+Hierarchical matrix indices are modal coefficient indices, with exactly the
+same numbering and normalization as a single hierarchical field in
+``MixedElementAssembler``. ``n_points`` and ``elements`` still describe the
+**geometry**, not the coefficient space. Matrix size is the scalar coefficient
+count multiplied by the component count inferred from ``forward``.
+``point_data`` (and the automatically supplied coordinate ``x``) continues to
+mean geometry-node data; it is not reinterpreted as modal coefficients.
+``element_data``, ``quadrature_data``, ``scalar_data`` and ``func`` remain
+available. Full-quadrature calls cache physical field gradients and geometry
+weights when coordinates do not require gradients; chunked calls reuse an
+existing full cache or compute only their active quadrature chunk.
+
+This opt-in currently covers **bilinear matrix assembly on tetrahedra** only.
+Hierarchical ``energy()``, material state updates and distributed assembly
+raise explicit errors. ``NodeAssembler`` and ``FacetAssembler`` retain their
+nodal APIs; use compatible modal loads, not an unchanged nodal RHS. For a
+discrete nodal load and a modal-to-nodal evaluation map ``T``, the corresponding
+modal load is ``T.T @ f`` (not field interpolation). Similarly, constraints
+must select the appropriate vertex/edge/face coefficient closure, not mesh
+node IDs. See :doc:`hierarchical_tetrahedra` for the connectivity builders and
+:doc:`hierarchical_tetrahedron_fields` for existing mixed-space field helpers.
+
+
+Calling the assembler
+~~~~~~~~~~~~~~~~~~~~~~
+
 The full call signature is
 
 .. code-block:: text

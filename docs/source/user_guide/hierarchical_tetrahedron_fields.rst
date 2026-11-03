@@ -169,5 +169,4 @@ value/gradient errors as JSON:
 The numerical tests additionally cover a quartic volume bubble, sine-solution
 p-convergence on a tetrahedral cube, conforming curved quadratic meshes,
 boundary-only component lifting, arbitrary coefficient axes, state/device
-movement and differentiation. CUDA cases are guarded when hardware is absent;
-CPU checks do not establish CUDA performance acceptance.
+movement and differentiation.

@@ -83,6 +83,8 @@ def distributed(asm_cls: Type[T]) -> Type[T]:
             :class:`DistributedMesh`. The actual assembly is deferred to
             :meth:`__call__`.
             """
+            if kw.get("basis") == "hierarchical":
+                raise NotImplementedError("distributed hierarchical DOF numbering is not supported")
             self = cls.__new__(cls)
             self._dmesh = dmesh
             self._from_mesh_kw = kw
