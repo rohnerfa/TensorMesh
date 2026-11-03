@@ -5,6 +5,7 @@ Internal helpers wired into :meth:`~tensormesh.Element.get_quadrature` and
 :meth:`~tensormesh.Element.get_facet_quadrature`. Not part of the public API.
 """
 from functools import lru_cache
+from numbers import Integral
 
 import torch
 from typing import Tuple
@@ -14,7 +15,7 @@ from .types import Tensorx2, Tensorx4, Tensorx5
 
 
 def _positive_order(order, rule):
-    if isinstance(order, bool) or not isinstance(order, int) or order < 1:
+    if isinstance(order, bool) or not isinstance(order, Integral) or order < 1:
         raise ValueError(f"{rule} quadrature order must be an integer >= 1")
 
 
@@ -86,7 +87,7 @@ def lin_quadrature(order: int = 1,
     order : int, optional
         Number of Gaussian points (>= 1), exact through degree
         ``2 * order - 1``. Defaults to 1. Unlike triangles, this parameter
-        counts points, not polynomial exactness degree (legacy convention).
+        counts points, not polynomial exactness degree.
     dtype : torch.dtype, optional
         Output dtype.
     device : torch.device, optional
@@ -145,7 +146,7 @@ def tri_quadrature(order: int = 1,
     ----------
     order : int, optional
         Requested polynomial exactness degree (>= 1). Defaults to 1.
-        Degrees 1..7 retain the original tabulated rules. Higher degrees
+        Degrees 1..7 use pre-tabulated rules. Higher degrees
         use a Gauss-Jacobi/Legendre conical product with
         ``ceil((order + 1) / 2)**2`` points. These generated rules have
         positive weights but are not symmetric or minimal-point rules.
@@ -223,11 +224,10 @@ def tet_quadrature(order: int = 1,
     Generated rules are cached in CPU float64 and returned as independent
     copies in the requested dtype/device. Their weights sum to 1/6.
 
-    Degrees 1..4 retain their original tables and point ordering. Degrees
-    5 and 6 use the 15- and 24-point rules formerly labelled 6 and 7;
-    the old labels overstated polynomial exactness by one degree.
-    Degree 7 now uses a generated 64-point rule. Each returned rule
-    integrates all polynomials through the requested degree.
+    Pre-tabulated degrees 5 and 6 use 15 and 24 points, respectively.
+    Degree 7 uses a generated 64-point rule. Each returned rule integrates
+    all polynomials through the requested degree. Some pre-tabulated rules
+    have negative weights or points on the boundary.
     """
     _positive_order(order, "tetrahedron")
     if order >= 7:
@@ -393,8 +393,8 @@ def pri_quadrature(order: int = 1,
     Parameters
     ----------
     order : int, optional
-        Triangle exactness degree and number of line points (>= 1),
-        preserving the existing mixed convention. Defaults to 1.
+        Triangle exactness degree and number of line points (>= 1).
+        The same integer selects both factors. Defaults to 1.
     dtype : torch.dtype, optional
         Output dtype.
     device : torch.device, optional

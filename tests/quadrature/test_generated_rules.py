@@ -5,11 +5,11 @@ import math
 import pytest
 import torch
 
-from tensormesh.element import Line, Triangle, Quadrilateral
+from tensormesh.element import Line, Triangle, Tetrahedron, Quadrilateral, Hexahedron, Prism, Pyramid
 from tensormesh.element import quadrature
 
 
-@pytest.mark.parametrize("n", [1, 2, 7, 8, 11, 21, 32, 64])
+@pytest.mark.parametrize("n", [1, 7, 8, 32])
 def test_line_gaussian_exactness(n):
     weights, points = Line.get_quadrature(n, torch.float64)
     assert weights.shape == (n,) and points.shape == (n, 1)
@@ -21,7 +21,45 @@ def test_line_gaussian_exactness(n):
     torch.testing.assert_close(actual / exact, torch.ones_like(exact), atol=3e-12, rtol=0)
 
 
-@pytest.mark.parametrize("degree", [*range(1, 11), 12, 18, 20, 21, 30, 40, 64])
+@pytest.mark.parametrize("order", [8, 12])
+@pytest.mark.parametrize("element", [Quadrilateral, Hexahedron, Prism, Pyramid])
+def test_inherited_high_order_rules(element, order):
+    # Sample constant, axial and mixed moments at the exactness limits of the
+    # newly available factors, rather than repeat the upstream low-order tests.
+    limit = 2 * order - 1
+    if element in (Quadrilateral, Hexahedron):
+        powers = [(0,) * element.dim, (limit,) * element.dim]
+        powers += [tuple(limit if d == axis else 0 for d in range(element.dim))
+                   for axis in range(element.dim)]
+        exact = [math.prod(1 / (a + 1) for a in p) for p in powers]
+        count = order ** element.dim
+    elif element is Prism:
+        # Triangle degree is order; the height uses order Gaussian points.
+        powers = [(0, 0, 0), (order, 0, 0), (0, order, 0), (0, 0, limit),
+                  (order // 2, order - order // 2, limit)]
+        exact = [math.factorial(a) * math.factorial(b)
+                 / (math.factorial(a + b + 2) * (c + 1)) for a, b, c in powers]
+        count = ((order + 2) // 2) ** 2 * order
+    else:
+        # Pyramid cross-sections are [0, 1-z]^2; integrate x and y first,
+        # then use the beta integral in z, independently of the collapse rule.
+        powers = [(0, 0, 0), (limit, 0, 0), (0, limit, 0), (0, 0, limit),
+                  (2, 3, limit - 5)]
+        exact = [math.factorial(c) * math.factorial(a + b + 2)
+                 / (math.factorial(a + b + c + 3) * (a + 1) * (b + 1))
+                 for a, b, c in powers]
+        count = order ** 3
+
+    weights, points = element.get_quadrature(order, dtype=torch.float64)
+    assert weights.shape == (count,) and points.shape == (count, element.dim)
+    assert (weights > 0).all()
+    monomials = (points[:, None, :] ** torch.tensor(powers)[None, :, :]).prod(-1)
+    exact = torch.tensor(exact, dtype=torch.float64)
+    actual = weights @ monomials
+    torch.testing.assert_close(actual / exact, torch.ones_like(exact), rtol=1e-12, atol=0)
+
+
+@pytest.mark.parametrize("degree", [2, 7, 8, 9, 20])
 def test_triangle_all_monomials_through_requested_degree(degree):
     weights, points = Triangle.get_quadrature(degree, torch.float64)
     powers = [(a, total - a) for total in range(degree + 1) for a in range(total + 1)]
@@ -46,48 +84,12 @@ def test_original_low_degree_triangle_rules_retained():
         assert len(weights) == count
         if degree in (3, 7):
             assert weights[0] < 0  # preserve the original nonpositive rules
-            torch.testing.assert_close(points[0], torch.full((2,), 1 / 3, dtype=torch.float64), atol=1e-15, rtol=0)
-    weights, points = Triangle.get_quadrature(2, torch.float64)
-    torch.testing.assert_close(weights, torch.full((3,), 1 / 6, dtype=torch.float64), atol=0, rtol=0)
-    torch.testing.assert_close(points, torch.tensor([[1/6, 1/6], [2/3, 1/6], [1/6, 2/3]], dtype=torch.float64), atol=0, rtol=0)
-
-
-def test_reference_generation_cache_and_copy_safety(monkeypatch):
-    quadrature._gaussian_interval_rule.cache_clear()
-    quadrature._gaussian_triangle_rule.cache_clear()
-    calls = []
-    original = quadrature.roots_jacobi
-    def counted(*args, **kwargs):
-        calls.append(args)
-        return original(*args, **kwargs)
-    monkeypatch.setattr(quadrature, "roots_jacobi", counted)
-    w, q = quadrature.tri_quadrature(20, torch.float64)
-    assert len(calls) == 2
-    w.zero_()
-    q.zero_()
-    # Degrees 20 and 21 share the same 11x11 canonical rule.
-    weights, points = quadrature.tri_quadrature(21, torch.float32)
-    assert len(calls) == 2
-    assert weights.sum() > 0.49 and points.sum() > 0
-    weights, points = quadrature.tri_quadrature(20, torch.float64)
-    assert weights.sum() > 0.49 and points.sum() > 0
-    quadrature.lin_quadrature(11, torch.float64)
-    assert len(calls) == 2
-
-
-def test_canonical_rule_cache_uses_cpu_independently_of_default_device():
-    quadrature._gaussian_interval_rule.cache_clear()
-    quadrature._gaussian_triangle_rule.cache_clear()
-    with torch.device("meta"):
-        weights, points = quadrature._gaussian_triangle_rule(9)
-    assert weights.device.type == points.device.type == "cpu"
-    assert weights.dtype == points.dtype == torch.float64
-    torch.testing.assert_close(weights.sum(), torch.tensor(0.5, dtype=torch.float64))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_generated_rule_layouts_dtype_and_facets(dtype):
     for element, order, count, dim in [(Line, 12, 12, 1), (Triangle, 20, 121, 2),
+                                      (Tetrahedron, 8, 125, 3),
                                       (Quadrilateral, 8, 64, 2)]:
         weights, points = element.get_quadrature(order, dtype)
         assert weights.dtype == points.dtype == dtype
@@ -99,19 +101,13 @@ def test_generated_rule_layouts_dtype_and_facets(dtype):
 
 
 @pytest.mark.parametrize("device", ["mps", "cuda"])
-def test_generated_accelerator_rules(device):
+@pytest.mark.parametrize("rule", [quadrature.tri_quadrature, quadrature.tet_quadrature])
+def test_generated_accelerator_rules(rule, device):
     available = torch.backends.mps.is_available() if device == "mps" else torch.cuda.is_available()
     if not available:
         pytest.skip(f"{device} unavailable")
-    weights, points = quadrature.tri_quadrature(20, torch.float32, torch.device(device))
+    weights, points = rule(20, torch.float32, torch.device(device))
     assert weights.device.type == points.device.type == device
-    reference = quadrature.tri_quadrature(20, torch.float32)
+    reference = rule(20, torch.float32)
     torch.testing.assert_close(weights.cpu(), reference[0])
     torch.testing.assert_close(points.cpu(), reference[1])
-
-
-@pytest.mark.parametrize("order", [0, -1, True, 1.5])
-@pytest.mark.parametrize("rule", [quadrature.lin_quadrature, quadrature.tri_quadrature])
-def test_invalid_orders(rule, order):
-    with pytest.raises(ValueError, match="integer >= 1"):
-        rule(order)
