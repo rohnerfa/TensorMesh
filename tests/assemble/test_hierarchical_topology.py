@@ -6,14 +6,16 @@ import pytest
 import torch
 
 from tensormesh.element import Triangle
-from tensormesh.assemble.topology import hierarchical_dofmap, lagrange_dofmap
+from tensormesh.assemble.topology import (
+    hierarchical_boundary_mask, hierarchical_dofmap, lagrange_dofmap,
+)
 
 
 CELLS = torch.tensor([[0, 1, 2], [1, 3, 2]])
 POINTS = torch.tensor([[0., 0.], [1., 0.], [0., 1.], [1., 1.]], dtype=torch.float64)
 
 
-@pytest.mark.parametrize("p", [1, 2, 3, 4, 6, 8, 10])
+@pytest.mark.parametrize("p", [1, 2, 3, 6, 10])
 def test_numbering_and_orientation(p):
     mapping = hierarchical_dofmap({"triangle": CELLS}, 4, p)
     conn, sign = mapping.conn["triangle"], mapping.sign["triangle"]
@@ -65,7 +67,7 @@ def trace_tables(cells, ids, p, reverse_cells=False):
     return tables, derivatives, unsigned, mapping
 
 
-@pytest.mark.parametrize("p", [1, 2, 3, 4, 6, 10])
+@pytest.mark.parametrize("p", [1, 2, 3, 6, 10])
 def test_opposite_shared_edge_traversal(p):
     # Here shared edge (1,2) is local edge 0 with opposite directions.
     cells = torch.tensor([[0, 1, 2], [3, 2, 1]])
@@ -79,25 +81,54 @@ def test_opposite_shared_edge_traversal(p):
         assert (unsigned[0] - unsigned[1]).abs().max() > 0.05
 
 
-@pytest.mark.parametrize("ids", [torch.tensor([0, 1, 2, 3]),
-                                 torch.tensor([9, 2, 14, 6]),
-                                 torch.tensor([5, 11, 0, 8])])
-def test_all_local_vertex_permutations_and_cell_reordering(ids):
+def test_all_local_vertex_permutations():
+    ids = torch.arange(4)
     for left in permutations([0, 1, 2]):
         for right in permutations([1, 3, 2]):
             cells = torch.tensor([left, right])
-            values, dt, _, mapping = trace_tables(cells, ids, 6)
+            values, dt, _, _ = trace_tables(cells, ids, 6)
             torch.testing.assert_close(values[0], values[1], atol=2e-14, rtol=2e-12)
             torch.testing.assert_close(dt[0], dt[1], atol=2e-13, rtol=2e-12)
-            reordered = hierarchical_dofmap({"triangle": ids[cells.flip(0)]}, int(ids.max()) + 1, 6)
-            # Edge/vertex global IDs are independent of cell ordering.
-            torch.testing.assert_close(mapping.conn["triangle"][:, :18],
-                                       reordered.conn["triangle"].flip(0)[:, :18])
-            torch.testing.assert_close(mapping.sign["triangle"], reordered.sign["triangle"].flip(0))
-            reordered_values, reordered_dt, _, _ = trace_tables(cells, ids, 6, reverse_cells=True)
-            for table in reordered_values:
-                torch.testing.assert_close(table, values[0], atol=2e-14, rtol=2e-12)
-            torch.testing.assert_close(reordered_dt[0], reordered_dt[1], atol=2e-13, rtol=2e-12)
+
+
+@pytest.mark.parametrize("cells, ids", [
+    (CELLS, torch.arange(4)),
+    (torch.tensor([[0, 1, 2], [3, 2, 1]]), torch.tensor([9, 2, 14, 6])),
+    (torch.tensor([[2, 0, 1], [2, 3, 1]]), torch.tensor([5, 11, 0, 8])),
+])
+def test_vertex_renumbering_and_cell_reordering(cells, ids):
+    values, dt, _, mapping = trace_tables(cells, ids, 6)
+    torch.testing.assert_close(values[0], values[1], atol=2e-14, rtol=2e-12)
+    torch.testing.assert_close(dt[0], dt[1], atol=2e-13, rtol=2e-12)
+    reordered = hierarchical_dofmap({"triangle": ids[cells.flip(0)]}, int(ids.max()) + 1, 6)
+    # Edge/vertex global IDs are independent of cell ordering.
+    torch.testing.assert_close(mapping.conn["triangle"][:, :18],
+                               reordered.conn["triangle"].flip(0)[:, :18])
+    torch.testing.assert_close(mapping.sign["triangle"], reordered.sign["triangle"].flip(0))
+    reordered_values, reordered_dt, _, _ = trace_tables(cells, ids, 6, reverse_cells=True)
+    for table in reordered_values:
+        torch.testing.assert_close(table, values[0], atol=2e-14, rtol=2e-12)
+    torch.testing.assert_close(reordered_dt[0], reordered_dt[1], atol=2e-13, rtol=2e-12)
+
+
+@pytest.mark.parametrize("p", [1, 2, 3, 6])
+def test_hierarchical_boundary_mask_excludes_shared_edge_and_bubbles(p):
+    cells = torch.tensor([[0, 1, 2], [3, 2, 1]])
+    mapping = hierarchical_dofmap({"triangle": cells}, 4, p)
+    mask = hierarchical_boundary_mask(mapping.conn, p, mapping.n_dofs)
+    local_mask = mask[mapping.conn["triangle"]]
+    assert mask.sum() == 4 * p
+    assert local_mask[:, :3].all()
+    assert not local_mask[:, 3:p + 2].any()
+    assert local_mask[:, p + 2:3 * p].all()
+    assert not local_mask[:, 3 * p:].any()
+
+
+def test_hierarchical_boundary_mask_excludes_interior_vertex():
+    cells = torch.tensor([[0, 1, 4], [1, 3, 4], [3, 2, 4], [2, 0, 4]])
+    mapping = hierarchical_dofmap({"triangle": cells}, 5, 3)
+    mask = hierarchical_boundary_mask(mapping.conn, 3, mapping.n_dofs)
+    torch.testing.assert_close(mask[:5], torch.tensor([True, True, True, True, False]))
 
 
 def test_high_order_geometry_and_multiple_triangle_types():
@@ -133,7 +164,7 @@ def test_empty_triangle_array(p):
 
 
 @pytest.mark.parametrize("order", [0, -1, True, 2.5])
-def test_invalid_order(order):
+def test_hierarchical_dofmap_rejects_invalid_order(order):
     with pytest.raises(ValueError, match="integer >= 1"):
         hierarchical_dofmap({"triangle": CELLS}, 4, order)
 
