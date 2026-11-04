@@ -42,7 +42,10 @@ def _geometry(layout, kind, cells, reference, gradients=False):
 def _sample(fn, points, components):
     """Call user data on flat [N,D] coordinates and validate/broadcast output."""
     flat = points.reshape(-1, points.shape[-1])
-    values = torch.as_tensor(fn(flat), dtype=points.dtype, device=points.device)
+    samples = fn(flat)
+    dtype = torch.as_tensor(samples).dtype
+    dtype = torch.promote_types(points.dtype, dtype) if dtype.is_complex else points.dtype
+    values = torch.as_tensor(samples, dtype=dtype, device=points.device)
     target = (len(flat),) if components == 1 else (len(flat), components)
     try:
         values = torch.broadcast_to(values, target)
@@ -146,9 +149,10 @@ def _reference_coordinates(layout, kind, cells, physical, max_iterations, tolera
     for _ in range(max_iterations):
         mapped, jac = _geometry(layout, kind, cells, reference, gradients=True)
         residual = mapped - physical
+        # Even a converged affine seed needs the curved inverse-map derivative.
+        reference = reference - solve(jac, residual[..., None]).squeeze(-1)
         if float(residual.detach().abs().max()) <= tol:
             break
-        reference = reference - solve(jac, residual[..., None]).squeeze(-1)
     residual = _geometry(layout, kind, cells, reference) - physical
     if not torch.isfinite(reference).all() or float(residual.detach().abs().max()) > tol:
         raise ValueError("physical-to-reference mapping did not converge")
@@ -240,7 +244,9 @@ def dirichlet_values(layout, name, fn, component=None):
         mask = layout.boundary_mask(name, component=0)
         off = asm._offsets[name]
         mask = mask[off:off + layout.n_nodes(name) * field.components].reshape(-1, field.components)[:, 0]
-        coefficients[mask] = _sample(fn, layout.points(name)[mask], c)
+        samples = _sample(fn, layout.points(name)[mask], c)
+        coefficients = coefficients.to(samples.dtype)
+        coefficients[mask] = samples
     else:
         counts = torch.zeros(layout.n_nodes(name), dtype=points.dtype, device=points.device)
         boundary = boundary_facet_mask(asm.elements)
@@ -262,19 +268,21 @@ def dirichlet_values(layout, name, fn, component=None):
                 table = basis.map(ref)[:, slots]
                 physical = _geometry(layout, kind, cells, ref[None].expand(len(cells), -1, -1))
                 samples = _sample(fn, physical, c)
-                rhs = samples.reshape(len(cells), p + 1, c)
-                local = torch.linalg.solve(table, rhs).reshape_as(samples)
+                dtype = torch.promote_types(coefficients.dtype, samples.dtype)
+                coefficients = coefficients.to(dtype)
+                rhs = samples.to(dtype).reshape(len(cells), p + 1, c)
+                local = torch.linalg.solve(table.to(dtype), rhs).reshape_as(samples)
                 conn = asm.field_conn[key][cells][:, slots]
                 sign = asm.field_sign[key][cells][:, slots]
                 local = local * sign.reshape(*sign.shape, *((1,) * (local.ndim - 2)))
                 _scatter_average(coefficients, counts, conn, local)
         coefficients = _finish_average(coefficients, counts)
-    block = torch.zeros(layout.n_nodes(name), field.components, dtype=points.dtype, device=points.device)
+    block = coefficients.new_zeros((layout.n_nodes(name), field.components))
     if component is None:
         block[:] = coefficients.reshape(-1, field.components)
     else:
         block[:, component] = coefficients
-    lifting = torch.zeros(layout.n_dofs, dtype=points.dtype, device=points.device)
+    lifting = coefficients.new_zeros((layout.n_dofs,))
     off = asm._offsets[name]
     lifting[off:off + block.numel()] = block.reshape(-1)
     return lifting
