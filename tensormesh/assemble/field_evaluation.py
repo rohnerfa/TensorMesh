@@ -9,7 +9,7 @@ import math
 
 import torch
 
-from ..element import Triangle, element_type2element
+from ..element import Triangle, element_type2element, element_type2order
 from .topology import boundary_facet_mask
 
 
@@ -26,7 +26,7 @@ def _geometry(layout, kind, cells, reference, gradients=False):
     """Map [E,Q,D] to physical points, optionally dX/d(reference)."""
     asm = layout._asm
     elem = element_type2element(kind)
-    basis = elem.get_basis_fns(asm.mesh_order, reference.dtype, reference.device)
+    basis = elem.get_basis_fns(element_type2order[kind], reference.dtype, reference.device)
     coords = asm._points[asm.elements[kind][cells]]
     e, q, d = reference.shape
     flat = reference.reshape(-1, d)
@@ -113,7 +113,7 @@ def restrict_modal(layout, name, point_data):
         elem = element_type2element(kind)
         e, q, d = reference.shape
         n_basis = asm.elements[kind].shape[1]
-        table = elem.get_basis_fns(asm.mesh_order, reference.dtype, reference.device).map(
+        table = elem.get_basis_fns(element_type2order[kind], reference.dtype, reference.device).map(
             reference.reshape(-1, d)).reshape(e, q, n_basis).to(point_data.dtype)
         return torch.einsum("eqb,eb...->eq...", table, point_data[asm.elements[kind][cells]])
     return _modal_interpolate(layout, name, sample)
@@ -220,7 +220,8 @@ def prolong_modal(layout, name, coefficients):
                       dtype=coefficients.dtype, device=coefficients.device)
     counts = torch.zeros(asm.n_points, dtype=asm._points.dtype, device=asm._points.device)
     for kind in asm.element_types:
-        ref = element_type2element(kind).get_basis(asm.mesh_order, asm._points.dtype, asm._points.device)
+        ref = element_type2element(kind).get_basis(
+            element_type2order[kind], asm._points.dtype, asm._points.device)
         values = evaluate(layout, name, coefficients, ref, element_type=kind)
         _scatter_average(out, counts, asm.elements[kind], values)
     return _finish_average(out, counts)

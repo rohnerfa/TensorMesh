@@ -149,6 +149,11 @@ and call ``from_mesh(...)`` + ``()``. Calling the assembler returns a
    K.shape
    # (143, 143)
 
+Triangle fields can opt into ``basis="hierarchical"`` and an independent
+``field_order`` in ``from_mesh``; geometry and ``point_data`` remain nodal,
+but the matrix is indexed by modal coefficients. See
+:doc:`hierarchical_triangles` for the supported scope and quadrature choice.
+
 That's the whole user story for a scalar bilinear form: one ``forward``
 method, three lines of glue, sparse matrix in hand.
 
@@ -298,6 +303,12 @@ result:
 
    mesh = Mesh.gen_rectangle(chara_length=0.05)
    b = L2Source.from_mesh(mesh)()                     # torch.Tensor [n_points]
+
+Triangle fields may select ``basis="hierarchical"`` and ``field_order`` in
+``from_mesh``. ``NodeAssembler.from_assembler`` also accepts a hierarchical
+ElementAssembler, sharing geometry and modal numbering. Both single-field
+assemblers expose ``field_layout(components=1)`` for interpolation and modal
+boundary data; see :doc:`hierarchical_triangles` for an end-to-end example.
 
 Call signature:
 
