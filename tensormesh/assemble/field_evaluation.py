@@ -148,7 +148,7 @@ def _reference_coordinates(layout, kind, cells, physical, max_iterations, tolera
     eps = torch.finfo(physical.dtype).eps
     scale = max(1.0, float(coords.detach().abs().max()))
     tol = 128 * eps * scale if tolerance is None else tolerance
-    for _ in range(max_iterations if asm.mesh_order > 1 else 0):
+    for _ in range(max_iterations if element_type2order[kind] > 1 else 0):
         mapped, jac = _geometry(layout, kind, cells, reference, gradients=True)
         residual = mapped - physical
         if float(residual.detach().abs().max()) <= tol:
