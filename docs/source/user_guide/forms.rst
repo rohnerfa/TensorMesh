@@ -149,6 +149,11 @@ and call ``from_mesh(...)`` + ``()``. Calling the assembler returns a
    K.shape
    # (143, 143)
 
+Triangle fields can opt into ``basis="hierarchical"`` and an independent
+``field_order`` in ``from_mesh``; geometry and ``point_data`` remain nodal,
+but the matrix is indexed by modal coefficients. See
+:doc:`hierarchical_triangles` for the supported scope and quadrature choice.
+
 That's the whole user story for a scalar bilinear form: one ``forward``
 method, three lines of glue, sparse matrix in hand.
 
@@ -202,10 +207,13 @@ available. Full-quadrature calls cache physical field gradients and geometry
 weights when coordinates do not require gradients; chunked calls reuse an
 existing full cache or compute only their active quadrature chunk.
 
-This opt-in currently covers **bilinear matrix assembly on tetrahedra** only.
+Hierarchical bilinear matrices support **triangles and tetrahedra**.
 Hierarchical ``energy()``, material state updates and distributed assembly
-raise explicit errors. ``NodeAssembler`` and ``FacetAssembler`` retain their
-nodal APIs; use compatible modal loads, not an unchanged nodal RHS. For a
+raise explicit errors. Hierarchical ``NodeAssembler`` and single-field
+``field_layout`` helpers currently support triangles only; tetrahedral field
+helpers remain available through MixedElementAssembler. ``FacetAssembler``
+retains its nodal API. For tetrahedra use compatible modal loads, not an
+unchanged nodal RHS. For a
 discrete nodal load and a modal-to-nodal evaluation map ``T``, the corresponding
 modal load is ``T.T @ f`` (not field interpolation). Similarly, constraints
 must select the appropriate vertex/edge/face coefficient closure, not mesh
@@ -362,6 +370,12 @@ result:
 
    mesh = Mesh.gen_rectangle(chara_length=0.05)
    b = L2Source.from_mesh(mesh)()                     # torch.Tensor [n_points]
+
+Triangle fields may select ``basis="hierarchical"`` and ``field_order`` in
+``from_mesh``. ``NodeAssembler.from_assembler`` also accepts a hierarchical
+ElementAssembler, sharing geometry and modal numbering. Both single-field
+assemblers expose ``field_layout(components=1)`` for interpolation and modal
+boundary data; see :doc:`hierarchical_triangles` for an end-to-end example.
 
 Call signature:
 

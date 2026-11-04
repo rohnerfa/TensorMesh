@@ -9,7 +9,8 @@ import torch.nn as nn
 from .projector import ReduceProjector, SparseProjector, Projector
 from .topology import build_edges
 from ..nn import BufferDict
-from ..element import element_type2dimension, element_type2order, Transformation
+from ..element import (element_type2dimension, element_type2order,
+                       element_type2element, Triangle, Tetrahedron, Transformation)
 from ..sparse import SparseMatrix
 from ..mesh import Mesh
 from ..vmap import vmap
@@ -195,6 +196,7 @@ class ElementAssembler(nn.Module):
         '__post_init__',
         'from_assembler',
         'from_mesh',
+        'field_layout',
     ]
     def __init__(self,
                         projector:nn.ModuleDict, 
@@ -323,6 +325,18 @@ class ElementAssembler(nn.Module):
         else:
             raise Exception(f"the shape of integral is supposed to be  1D or 3D, but got {integral.shape}")
 
+    def field_layout(self, components:int = 1):
+        """Return the hierarchical field's BlockLayout, named ``u``.
+
+        Choose the component count to match the assembled matrix. This provides
+        interpolation, evaluation, nodal restriction/prolongation and modal
+        boundary masks/liftings, without treating coefficients as point values.
+        The returned layout follows this assembler's geometry and device changes.
+        """
+        if self._hierarchical is None:
+            raise NotImplementedError("field_layout() currently requires a hierarchical field")
+        return self._hierarchical.layout(self, components)
+
     def __call__(self, points:Optional[torch.Tensor] = None, 
                        func:Optional[Callable] = None,
                        point_data:Optional[Mapping[str, torch.Tensor]] = None, 
@@ -433,9 +447,10 @@ class ElementAssembler(nn.Module):
 
         signature = inspect.signature(fn)
 
+        element_values = hierarchical and self._hierarchical.element_dependent
         broadcast_fns = [
-            (lambda x: x=="u"     , InputBroadcast(hierarchical, True, True,  False)),
-            (lambda x: x=="v"     , InputBroadcast(hierarchical, True, False,  True)),
+            (lambda x: x=="u"     , InputBroadcast(element_values, True, True,  False)),
+            (lambda x: x=="v"     , InputBroadcast(element_values, True, False,  True)),
             (lambda x: x=="gradu" , InputBroadcast(True,  True, True,  False)), # [n_element, n_quadrature, n_u_basis,         :, n_dim]
             (lambda x: x=="gradv" , InputBroadcast(True,  True, False,  True)), # [n_element, n_quadrature,         :, n_v_basis, n_dim]
             (lambda x: x in element_data.keys(),
@@ -585,7 +600,9 @@ class ElementAssembler(nn.Module):
                 batch_integral = self._integrate(batch_integral, jxw, trans.n_elements, n_basis, use_element_parallel)
 
                 element_integral = batch_integral if element_integral is None else element_integral + batch_integral
-            
+
+            if hierarchical:
+                element_integral = field.orient(element_integral)
             integral = proj(element_integral) if integral is None else integral + proj(element_integral) # type:ignore [n_edge, ...]
 
         return self._build_output(integral)
@@ -929,6 +946,8 @@ class ElementAssembler(nn.Module):
         """
         assert isinstance(obj, ElementAssembler), f"obj must be an instance of ElementAssembler, but got {type(obj)}"
         if obj._hierarchical is not None:
+            if hasattr(cls, "update_state"):
+                raise NotImplementedError("hierarchical material state updates are not supported")
             kwargs["_hierarchical"] = obj._hierarchical
         return cls(
                    obj.projector, 
@@ -959,13 +978,13 @@ class ElementAssembler(nn.Module):
         project : {'reduce', 'sparse'}, optional
             Backend used for the element-to-edge scatter; defaults to ``'reduce'``.
         basis : {'lagrange', 'hierarchical'}
-            Keyword-only field basis family. The default leaves existing nodal assembly
-            unchanged. Hierarchical fields currently support tetrahedra and
-            bilinear matrix assembly only; geometry remains nodal.
+            Keyword-only field basis family. Lagrange remains the default.
+            Hierarchical fields support triangle/tetrahedron bilinear matrices;
+            geometry and point_data remain nodal Lagrange fields.
         field_order : int, optional
-            Keyword-only field degree, defaulting to the mesh degree. A different degree is
-            currently supported only with ``basis='hierarchical'``. Quadrature
-            still defaults to degree 2: choose it explicitly for higher orders.
+            Keyword-only field degree, defaulting to the mesh degree. A different
+            degree currently requires ``basis='hierarchical'``. Quadrature still
+            defaults to degree 2; choose it explicitly for higher-order fields.
         *args, **kwargs
             Additional arguments forwarded to ``__post_init__``.
 
@@ -992,14 +1011,21 @@ class ElementAssembler(nn.Module):
         field_elements = elements
         orders = {element_type2order[kind] for kind in elements}
         if basis == "hierarchical":
-            from .topology import hierarchical_tetrahedron_dofmap
+            from .topology import hierarchical_dofmap, hierarchical_tetrahedron_dofmap
             if field_order is None:
                 if len(orders) != 1:
                     raise ValueError("field_order is required for mixed geometry degrees")
                 field_order = next(iter(orders))
             if hasattr(cls, "update_state"):
                 raise NotImplementedError("hierarchical material state updates are not supported")
-            mapping = hierarchical_tetrahedron_dofmap(elements, n_points, field_order)
+            shapes = {element_type2element(kind) for kind in elements}
+            if shapes == {Triangle}:
+                mapping = hierarchical_dofmap(elements, n_points, field_order)
+            elif shapes == {Tetrahedron}:
+                mapping = hierarchical_tetrahedron_dofmap(elements, n_points, field_order)
+            else:
+                raise NotImplementedError(
+                    "hierarchical fields support triangle or tetrahedron meshes only")
             field_elements = mapping.conn
         elif field_order is not None and orders != {field_order}:
             raise ValueError("a different field_order requires basis='hierarchical'")
