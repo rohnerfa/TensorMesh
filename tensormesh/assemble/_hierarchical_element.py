@@ -100,6 +100,7 @@ class _SingleFieldView:
         self.fields = [field]
         self._offsets = {"u": 0}
         self.field_kind = {"u": "hierarchical"}
+        self.grouped_tetrahedra = False
         self.field_n_nodes = {"u": assembler._hierarchical.n_dofs}
         self.n_dofs = self.field_n_nodes["u"] * field.components
         self.n_points = assembler.n_points
