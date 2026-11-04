@@ -210,13 +210,15 @@ existing full cache or compute only their active quadrature chunk.
 Hierarchical bilinear matrices support **triangles and tetrahedra**.
 Hierarchical ``energy()``, material state updates and distributed assembly
 raise explicit errors. Hierarchical ``NodeAssembler`` and single-field
-``field_layout`` helpers currently support triangles only. ``FacetAssembler``
+``field_layout`` helpers currently support triangles only; tetrahedral field
+helpers remain available through MixedElementAssembler. ``FacetAssembler``
 retains its nodal API. For tetrahedra use compatible modal loads, not an
-unchanged nodal RHS. For a discrete nodal load and a modal-to-nodal evaluation
-map ``T``, the corresponding modal load is ``T.T @ f`` (not field interpolation).
-Similarly, constraints must select the appropriate vertex/edge/face coefficient
-closure, not mesh node IDs. See :doc:`hierarchical_tetrahedra` for the connectivity
-builders and boundary masks.
+unchanged nodal RHS. For a
+discrete nodal load and a modal-to-nodal evaluation map ``T``, the corresponding
+modal load is ``T.T @ f`` (not field interpolation). Similarly, constraints
+must select the appropriate vertex/edge/face coefficient closure, not mesh
+node IDs. See :doc:`hierarchical_tetrahedra` for the connectivity builders and
+:doc:`hierarchical_tetrahedron_fields` for existing mixed-space field helpers.
 
 
 Calling the assembler
