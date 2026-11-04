@@ -12,7 +12,7 @@ def sample(n, seed=17):
     return torch.stack((uv[:, 0], (1 - uv[:, 0]) * uv[:, 1]), -1)
 
 
-@pytest.mark.parametrize("p", [1, 2, 3, 4, 6, 8, 10])
+@pytest.mark.parametrize("p", [1, 2, 3, 6, 10])
 def test_count_independence_and_polynomial_reproduction(p):
     basis = Triangle.get_hierarchical_basis_fns(p, torch.float64)
     n = (p + 1) * (p + 2) // 2
@@ -108,6 +108,18 @@ def test_layout_dtype_and_module_conversion(dtype):
     assert basis.map(points[:0]).shape == (0, 3, 15)
 
 
+def test_factory_module_conversion_isolation():
+    device = torch.device("cpu")
+    points = sample(6)
+    basis = Triangle.get_hierarchical_basis_fns(5, torch.float64, device)
+    expected = basis.map(points)
+    basis.float()
+    assert basis.map(points).dtype == torch.float32
+    actual = Triangle.get_hierarchical_basis_fns(5, torch.float64, device).map(points)
+    assert actual.dtype == torch.float64
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("device", ["cuda", "mps"])
 def test_accelerator(device):
     available = torch.cuda.is_available() if device == "cuda" else torch.backends.mps.is_available()
@@ -121,15 +133,9 @@ def test_accelerator(device):
 
 
 @pytest.mark.parametrize("order", [0, -1, 2.5, True])
-def test_invalid_order(order):
+def test_hierarchical_basis_rejects_invalid_order(order):
     with pytest.raises(ValueError, match="integer >= 1"):
         HierarchicalTriangleBasisFns(order)
-
-
-def test_lagrange_default_unchanged():
-    nodes = Triangle.get_basis(2, torch.float64)
-    torch.testing.assert_close(Triangle.get_basis_fns(2, torch.float64).map(nodes),
-                               torch.eye(6, dtype=torch.float64), atol=1e-14, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

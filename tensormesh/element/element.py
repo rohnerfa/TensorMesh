@@ -1789,10 +1789,9 @@ class Triangle(Element):
     n_cell   = 0
 
     @classmethod
-    @lru_cache()
     def get_hierarchical_basis_fns(cls, order=1, dtype=torch.float32,
                                    device=torch.device('cpu')):
-        """Return non-nodal H1 functions; does not alter the Lagrange default.
+        """Return fresh non-nodal H1 functions; does not alter the Lagrange default.
 
         See :class:`~tensormesh.element.HierarchicalTriangleBasisFns` for
         ordering, edge parity, and the compatible map/grad interface.
