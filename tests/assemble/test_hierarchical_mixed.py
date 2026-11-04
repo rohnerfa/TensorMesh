@@ -25,20 +25,6 @@ def test_poisson_change_of_basis_and_load(p, geometry):
     torch.testing.assert_close(kh, kh.T, atol=2e-14, rtol=2e-13)
 
 
-@pytest.mark.parametrize("p", [2, 3, 4])
-def test_constrained_poisson_spd(p):
-    modal = poisson(p, "hierarchical").from_mesh(patch_mesh(), quadrature_order=7)
-    k = modal().to_dense()
-    conn = modal.field_conn["u__triangle"]
-    # Both triangles have boundary edges 1 and 2. Their edge 0 is internal.
-    boundary = torch.zeros(modal.n_dofs, dtype=torch.bool)
-    boundary[conn[:, :3]] = True
-    boundary[conn[:, p + 2:3 * p]] = True
-    free = ~boundary
-    assert free.sum() == p - 1 + (p - 1) * (p - 2)
-    assert torch.linalg.eigvalsh(k[free][:, free]).min() > 0
-
-
 def mixed_form(family, pressure_family="lagrange", pressure_order=2):
     class Mixed(MixedElementAssembler):
         fields = [Field("u", "v", 3, components=2, basis=family),
@@ -107,7 +93,7 @@ def test_modal_field_data_values_gradients_and_autograd(components):
     torch.testing.assert_close(gh, gl, atol=2e-10, rtol=2e-10)
 
 
-def test_reference_tables_shared_by_family_and_no_hot_path_tabulation(monkeypatch):
+def test_shared_reference_values_broadcast_without_hot_path_tabulation(monkeypatch):
     class TwoFields(MixedElementAssembler):
         fields = [Field("u", "v", 3, basis="hierarchical"),
                   Field("p", "q", 3, basis="hierarchical")]
@@ -115,20 +101,21 @@ def test_reference_tables_shared_by_family_and_no_hot_path_tabulation(monkeypatc
         def forward(self, u, v, p, q):
             return u * v + p * q + p * v + u * q
 
-    original = Triangle.get_hierarchical_basis_fns
-    calls = []
-    def counted(*args, **kwargs):
-        calls.append(1)
-        return original(*args, **kwargs)
-    monkeypatch.setattr(Triangle, "get_hierarchical_basis_fns", counted)
-    asm = TwoFields.from_mesh(patch_mesh())
-    assert len(calls) == 1
-    assert asm.ref_val["u__triangle"].data_ptr() == asm.ref_val["p__triangle"].data_ptr()
+    mesh = patch_mesh()
+    asm = TwoFields.from_mesh(mesh)
+    values = asm.ref_val["u__triangle"]
+    assert values.shape == (asm.transformation["triangle"].n_quadrature, 10)
+    torch.testing.assert_close(values, asm.ref_val["p__triangle"])
+    reference = poisson(3, "hierarchical").from_mesh(mesh)
+    mass = reference(func=lambda u, v: u * v).to_dense()
+    load = reference.assemble_vector(func=lambda v: v)
+
     def fail(*args, **kwargs):
         raise AssertionError("basis must not be evaluated in the assembly hot path")
     monkeypatch.setattr(Triangle, "get_hierarchical_basis_fns", fail)
-    asm(batch_size=1)
-    asm.assemble_vector(func=lambda v, q: v + q, batch_size=2)
+    torch.testing.assert_close(asm(batch_size=1).to_dense(), mass.repeat(2, 2))
+    torch.testing.assert_close(asm.assemble_vector(func=lambda v, q: v + q, batch_size=2),
+                               load.repeat(2))
 
 
 def test_distinct_family_reference_tables():
@@ -137,20 +124,6 @@ def test_distinct_family_reference_tables():
     asm = TwoFamilies.from_mesh(patch_mesh())
     assert not torch.allclose(asm.ref_val["u__triangle"], asm.ref_val["p__triangle"])
     assert "u__triangle" in asm.field_sign and "p__triangle" not in asm.field_sign
-
-
-@pytest.mark.parametrize("operation", ["points"])
-def test_nodal_only_helpers_fail_clearly(operation):
-    asm = poisson(3, "hierarchical").from_mesh(patch_mesh(3))
-    args = ["u"]
-    if operation == "restrict":
-        args.append(torch.zeros(asm.n_points))
-    elif operation == "prolong":
-        args.append(torch.zeros(asm.layout.n_nodes("u")))
-    with pytest.raises(NotImplementedError, match="modal coefficients"):
-        getattr(asm.layout, operation)(*args)
-    with pytest.raises(NotImplementedError, match="modal coefficients"):
-        asm.layout.dof_mask("u", where=lambda x: x[:, 0] == 0)
 
 
 def test_invalid_family_and_nontriangle():

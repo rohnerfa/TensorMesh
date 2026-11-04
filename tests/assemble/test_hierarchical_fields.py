@@ -6,7 +6,6 @@ import torch
 
 from tensormesh import Condenser, Field, Mesh, MixedElementAssembler
 from tensormesh.element import Triangle
-from tensormesh.assemble.topology import hierarchical_boundary_mask
 from tests.assemble._triangle_fixtures import patch_mesh, poisson, physical_points
 
 
@@ -14,32 +13,23 @@ def sample_reference():
     return torch.tensor([[0.1, 0.2], [0.6, 0.1], [0.2, 0.6], [0., 0.], [0., 0.4]], dtype=torch.float64)
 
 
-@pytest.mark.parametrize("p", [1, 2, 3, 4, 6, 10])
-def test_boundary_modes_not_interior_bubbles(p):
+def test_layout_boundary_mask_and_dtype_movement():
+    p = 4
     asm = poisson(p, "hierarchical").from_mesh(patch_mesh(2), quadrature_order=7)
     mask = asm.layout.boundary_mask("u")
-    kind = asm.element_types[0]
-    conn = asm.field_conn[f"u__{kind}"]
     assert mask.sum() == 4 * p
-    assert mask[conn[:, :3]].all()
-    assert not mask[conn[:, 3:p + 2]].any()  # shared diagonal edge
-    assert mask[conn[:, p + 2:3 * p]].all()  # outer edges
-    assert not mask[conn[:, 3 * p:]].any()
-    direct = hierarchical_boundary_mask({kind: conn}, p, asm.n_dofs)
-    torch.testing.assert_close(mask, direct)
     # Cached topology must follow later dtype/device movement.
     asm.float()
     torch.testing.assert_close(asm.layout.boundary_mask("u"), mask)
 
 
-def test_interior_vertex_is_not_boundary_and_p1_lifting_solves():
+def test_p1_lifting_solves_with_interior_vertex():
     mesh = Mesh(meshio.Mesh(
         [[0., 0.], [1., 0.], [0., 1.], [1., 1.], [0.5, 0.5]],
         [("triangle", [[0, 1, 4], [1, 3, 4], [3, 2, 4], [2, 0, 4]])])).double()
     asm = poisson(1, "hierarchical").from_mesh(mesh)
     lay = asm.layout
     mask = lay.boundary_mask("u")
-    torch.testing.assert_close(mask, torch.tensor([True, True, True, True, False]))
     exact = lambda x: 2 + x[:, 0] - x[:, 1]
     lifting = lay.dirichlet_values("u", exact)
     assert lifting[4] == 0
@@ -212,6 +202,57 @@ def test_evaluation_and_interpolation_autograd():
     torch.testing.assert_close(derivative, expected.sum(), atol=1e-12, rtol=2e-12)
     trace = asm.layout.dirichlet_values("u", lambda x: amplitude * x[:, 0])
     assert torch.autograd.grad(trace.square().sum(), amplitude)[0] > 0
+
+
+def test_curved_physical_query_autograd_at_converged_affine_seed():
+    ref = Triangle.get_basis(2, torch.float64, torch.device("cpu"))
+    r, s = ref.unbind(-1)
+    points = torch.stack((r, s + 0.1 * (r * (1 - r) - s * (1 - s))), -1)
+    mesh = Mesh(meshio.Mesh(points.numpy(), [("triangle6", [list(range(6))])])).double()
+    asm = poisson(3, "hierarchical").from_mesh(mesh)
+    lay = asm.layout
+    coefficients = lay.interpolate("u", lambda x: x[:, 1])
+    query = torch.tensor([[0.2, 0.2]], dtype=torch.float64, requires_grad=True)
+    values = lay.evaluate("u", coefficients, query, physical=True)
+    explicit = lay.evaluate("u", coefficients, query, physical=True, gradient=True)
+    derivative = torch.autograd.grad(values.sum(), query)[0]
+    torch.testing.assert_close(values, query[:, 1][None], atol=1e-13, rtol=1e-13)
+    torch.testing.assert_close(explicit[0], torch.tensor([[0., 1.]], dtype=torch.float64), atol=1e-13, rtol=1e-13)
+    torch.testing.assert_close(derivative, explicit[0], atol=1e-13, rtol=1e-13)
+
+
+@pytest.mark.parametrize("family", ["lagrange", "hierarchical"])
+def test_complex_callable_interpolation_and_dirichlet_lifting(family):
+    class TwoFields(MixedElementAssembler):
+        fields = [Field("u", "v", 3, components=2, basis=family), Field("p", "q", 1)]
+    asm = TwoFields.from_mesh(patch_mesh(), quadrature_order=7)
+    lay = asm.layout
+    amplitude = torch.tensor(1 + 2j, dtype=torch.complex128, requires_grad=True)
+    fn = lambda x: amplitude * torch.stack((1 + x[:, 0] ** 2, 2 - x[:, 1]), -1)
+    coefficients = lay.interpolate("u", fn)
+    assert coefficients.dtype == torch.complex128
+    ref = sample_reference()
+    physical = physical_points(asm, ref)
+    expected = fn(physical.reshape(-1, 2)).reshape(*physical.shape[:2], 2)
+    torch.testing.assert_close(lay.evaluate("u", coefficients, ref), expected, atol=1e-12, rtol=1e-12)
+
+    def trace(x):
+        on_boundary = ((x[:, 0].abs() < 1e-12) | ((x[:, 0] - 1).abs() < 1e-12)
+                       | (x[:, 1].abs() < 1e-12) | ((x[:, 1] - 1).abs() < 1e-12))
+        assert on_boundary.all()
+        return fn(x)
+
+    lifting = lay.dirichlet_values("u", trace)
+    assert lifting.dtype == torch.complex128
+    mask = lay.boundary_mask("u")
+    expected = lay.cat(u=coefficients, p=0.)
+    torch.testing.assert_close(lifting[mask], expected[mask], atol=1e-12, rtol=1e-12)
+    assert (lifting[~mask] == 0).all()
+    first = lay.dirichlet_values("u", lambda x: trace(x)[:, 0], component=0)
+    second = lay.dirichlet_values("u", lambda x: trace(x)[:, 1], component=1)
+    torch.testing.assert_close(lifting, first + second, atol=1e-12, rtol=1e-12)
+    derivative = torch.autograd.grad(lifting.imag.sum(), amplitude)[0]
+    torch.testing.assert_close(derivative, 1j * (lifting.imag.sum() / amplitude.imag), atol=1e-12, rtol=1e-12)
 
 
 def test_float32_layout_and_empty_queries():

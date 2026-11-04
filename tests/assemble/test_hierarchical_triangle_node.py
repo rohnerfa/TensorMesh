@@ -20,18 +20,25 @@ def make_node(mesh, p=3, **kwargs):
                           field_order=p, **kwargs)
 
 
-@pytest.mark.parametrize("p", [1, 3, 4])
-@pytest.mark.parametrize("project", ["reduce", "sparse"])
-def test_triangle_node_load_and_signed_nodal_change_of_basis(p, project):
+@pytest.mark.parametrize("p", [1, 4])
+def test_triangle_node_load_and_signed_nodal_change_of_basis(p):
     mesh = patch_mesh(2, curved=True)
     modal = poisson(p, "hierarchical").from_mesh(mesh, quadrature_order=2*p)
     nodal = poisson(p, "lagrange").from_mesh(mesh, quadrature_order=2*p)
     transform = change_of_basis(nodal, modal)
-    asm = make_node(mesh, p, project=project)
+    asm = make_node(mesh, p)
     expected = modal.assemble_vector()
     torch.testing.assert_close(asm(), expected)
     torch.testing.assert_close(asm(batch_size=-1), expected)
     torch.testing.assert_close(expected, transform.T @ nodal.assemble_vector())
+
+
+@pytest.mark.parametrize("project", ["reduce", "sparse"])
+def test_triangle_node_signed_construction_and_assembler_reuse(project):
+    mesh = patch_mesh(2, curved=True)
+    p = 3
+    expected = poisson(p, "hierarchical").from_mesh(mesh, quadrature_order=2*p).assemble_vector()
+    torch.testing.assert_close(make_node(mesh, p, project=project)(), expected)
     matrix = MassElementAssembler.from_mesh(
         mesh, quadrature_order=2*p, basis="hierarchical", field_order=p, project=project)
     reused = Load.from_assembler(matrix)

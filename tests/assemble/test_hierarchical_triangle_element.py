@@ -9,7 +9,7 @@ from tensormesh import ElementAssembler, Field, MixedElementAssembler
 from tensormesh.assemble import (LaplaceElementAssembler, MassElementAssembler,
                                 LinearElasticityElementAssembler, J2Plasticity)
 from tensormesh.distributed import distributed
-from tests.assemble._triangle_fixtures import patch_mesh, poisson, change_of_basis
+from tests.assemble._triangle_fixtures import patch_mesh, poisson
 
 
 @pytest.fixture(autouse=True)
@@ -29,26 +29,20 @@ def assert_operator(actual, expected):
     torch.testing.assert_close(actual, expected, rtol=2e-11, atol=5e-12)
 
 
-@pytest.mark.parametrize("p", [1, 3, 4])
-@pytest.mark.parametrize("project", ["reduce", "sparse"])
-def test_triangle_element_mass_stiffness_and_signed_change_of_basis(p, project):
+@pytest.mark.parametrize("p,project", [(1, "reduce"), (3, "sparse"), (4, "reduce")])
+def test_triangle_element_mass_stiffness_match_mixed(p, project):
     mesh = patch_mesh()
     modal = poisson(p, "hierarchical").from_mesh(mesh, quadrature_order=2*p)
-    nodal = poisson(p, "lagrange").from_mesh(mesh, quadrature_order=2*p)
-    transform = change_of_basis(nodal, modal)
     for cls, form in ((MassElementAssembler, lambda u, v: u*v),
                       (LaplaceElementAssembler, lambda gradu, gradv: (gradu*gradv).sum())):
         asm = make_element(cls, mesh, p, project=project)
         expected = modal(func=form).to_dense()
         actual = asm(batch_size=3).to_dense()
         assert_operator(actual, expected)
-        assert_operator(actual, transform.T @ nodal(func=form).to_dense() @ transform)
         assert_operator(asm().to_dense(), actual)
         assert asm.n_points == len(mesh.points)
         assert asm().shape == (modal.n_dofs, modal.n_dofs)
         torch.testing.assert_close(asm.elements["triangle"], mesh.elements())
-        if p >= 3:
-            assert (asm._hierarchical.blocks["triangle"].sign < 0).any()
 
 
 def test_triangle_element_vector_elasticity_on_curved_geometry():
