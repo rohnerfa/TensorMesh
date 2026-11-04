@@ -9,7 +9,8 @@ import torch.nn as nn
 from .projector import ReduceProjector, SparseProjector, Projector
 from .topology import build_edges
 from ..nn import BufferDict
-from ..element import element_type2dimension, element_type2order, Transformation
+from ..element import (element_type2dimension, element_type2order,
+                       element_type2element, Triangle, Tetrahedron, Transformation)
 from ..sparse import SparseMatrix
 from ..mesh import Mesh
 from ..vmap import vmap
@@ -307,8 +308,10 @@ class ElementAssembler(nn.Module):
             COO sparse matrix; block-COO if ``integral`` is 3D (vector problems).
         """
         if integral.dim() == 1:
-            return SparseMatrix(integral, self.edges[0], self.edges[1],
-                                shape=(self._matrix_size, self._matrix_size))
+            return SparseMatrix(
+                integral, self.edges[0], self.edges[1],
+                shape=(self._matrix_size, self._matrix_size),
+            )
         elif integral.dim() ==  3:
             block_size = integral.shape[1]
             assert integral.shape[2] == block_size, (
@@ -444,9 +447,10 @@ class ElementAssembler(nn.Module):
 
         signature = inspect.signature(fn)
 
+        element_values = hierarchical and self._hierarchical.element_dependent
         broadcast_fns = [
-            (lambda x: x=="u"     , InputBroadcast(False, True, True,  False)), # [:        , n_quadrature, n_u_basis,         :]
-            (lambda x: x=="v"     , InputBroadcast(False, True, False,  True)), # [:        , n_quadrature,         :, n_v_basis]
+            (lambda x: x=="u"     , InputBroadcast(element_values, True, True,  False)),
+            (lambda x: x=="v"     , InputBroadcast(element_values, True, False,  True)),
             (lambda x: x=="gradu" , InputBroadcast(True,  True, True,  False)), # [n_element, n_quadrature, n_u_basis,         :, n_dim]
             (lambda x: x=="gradv" , InputBroadcast(True,  True, False,  True)), # [n_element, n_quadrature,         :, n_v_basis, n_dim]
             (lambda x: x in element_data.keys(),
@@ -539,6 +543,7 @@ class ElementAssembler(nn.Module):
                 if hierarchical:
                     shape_val, shape_grad, jxw, inverse = field.batch(
                         trans, i*n_batch_size, n_batch_size)
+                    # point_data (including x) always belongs to nodal geometry.
                     nodal_val = trans.batch_shape_val(i*n_batch_size, n_batch_size)
                     nodal_grad = None
                     n_basis = field.conn.shape[1]
@@ -894,9 +899,8 @@ class ElementAssembler(nn.Module):
         Returns
         -------
         torch.Tensor
-            Either a 2D tensor of shape ``[B, B]`` (scalar problems) or a 4D
-            tensor of shape ``[B, B, H, H]`` (vector problems with ``H``
-            degrees of freedom per node).
+            A scalar (shape ``[]``) or a component block ``[H, H]``. The
+            assembler's vmap layers generate the basis-pair axes ``[B, B]``.
         """
         raise NotImplementedError("forward is not implemented")
         
@@ -950,7 +954,7 @@ class ElementAssembler(nn.Module):
                    obj.transformation,
                    obj.elements,
                    obj.edges,
-                   *args,**kwargs)
+                   *args, **kwargs)
 
     @classmethod
     def from_mesh(cls, mesh:Mesh,
@@ -975,7 +979,7 @@ class ElementAssembler(nn.Module):
             Backend used for the element-to-edge scatter; defaults to ``'reduce'``.
         basis : {'lagrange', 'hierarchical'}
             Keyword-only field basis family. Lagrange remains the default.
-            Hierarchical fields support triangles and bilinear matrix assembly;
+            Hierarchical fields support triangle/tetrahedron bilinear matrices;
             geometry and point_data remain nodal Lagrange fields.
         field_order : int, optional
             Keyword-only field degree, defaulting to the mesh degree. A different
@@ -1007,14 +1011,21 @@ class ElementAssembler(nn.Module):
         field_elements = elements
         orders = {element_type2order[kind] for kind in elements}
         if basis == "hierarchical":
-            from .topology import hierarchical_dofmap
+            from .topology import hierarchical_dofmap, hierarchical_tetrahedron_dofmap
             if field_order is None:
                 if len(orders) != 1:
                     raise ValueError("field_order is required for mixed geometry degrees")
                 field_order = next(iter(orders))
             if hasattr(cls, "update_state"):
                 raise NotImplementedError("hierarchical material state updates are not supported")
-            mapping = hierarchical_dofmap(elements, n_points, field_order)
+            shapes = {element_type2element(kind) for kind in elements}
+            if shapes == {Triangle}:
+                mapping = hierarchical_dofmap(elements, n_points, field_order)
+            elif shapes == {Tetrahedron}:
+                mapping = hierarchical_tetrahedron_dofmap(elements, n_points, field_order)
+            else:
+                raise NotImplementedError(
+                    "hierarchical fields support triangle or tetrahedron meshes only")
             field_elements = mapping.conn
         elif field_order is not None and orders != {field_order}:
             raise ValueError("a different field_order requires basis='hierarchical'")
@@ -1074,7 +1085,7 @@ class ElementAssembler(nn.Module):
                    transformations,
                    elements,
                    edges,
-                   *args,**kwargs)
+                   *args, **kwargs)
         assembler = assembler.type(mesh.dtype).to(mesh.device)
         return assembler
       

@@ -7,6 +7,9 @@ and topological coefficient map are independent of geometry order. Select
 ``Field(..., basis="hierarchical")`` in :class:`~tensormesh.MixedElementAssembler`
 to assemble these spaces. This chapter describes their mathematical and API
 contract; see :doc:`mixed_assembly` for grouped integration and chunking.
+Single-field bilinear forms can also opt into this basis through
+``ElementAssembler.from_mesh(..., basis="hierarchical", field_order=p)``;
+see :ref:`forms-hierarchical-element` for quadrature and compatibility limits.
 
 Reference element and local layout
 ----------------------------------
