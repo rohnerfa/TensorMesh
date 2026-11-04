@@ -680,6 +680,8 @@ class NodeAssembler(nn.Module):
             A new assembler sharing the same mesh.
         """
         if isinstance(obj, ElementAssembler) and obj._hierarchical is not None:
+            if obj._hierarchical.element_dependent:
+                raise NotImplementedError("hierarchical NodeAssembler currently supports triangles only")
             projector = nn.ModuleDict({
                 kind: _node_projector(block.conn, obj._hierarchical.n_dofs,
                                       "sparse" if isinstance(obj.projector[kind], SparseProjector)
