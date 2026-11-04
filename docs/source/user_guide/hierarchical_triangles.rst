@@ -107,6 +107,80 @@ both test and trial sides. The batched integration and ``ReduceProjector``
 are unchanged. For hierarchical ``field_data``, supply global modal
 coefficients: gathered coefficients receive signs before interpolation.
 
+ElementAssembler
+----------------
+
+For a single-field bilinear form, the existing ElementAssembler subclasses
+can also select hierarchical triangle fields:
+
+.. code-block:: python
+
+   from tensormesh.assemble import LaplaceElementAssembler
+
+   stiffness = LaplaceElementAssembler.from_mesh(
+       mesh, basis="hierarchical", field_order=4, quadrature_order=8)
+   matrix = stiffness()
+
+``basis="lagrange"`` remains the default. ``field_order`` defaults to the
+geometry mesh degree; specify it to use a higher-order field on low-order
+geometry. Geometry connectivity, ``n_points``, ``point_data`` and its
+gradients remain nodal. Matrix dimensions instead use the number of modal
+coefficients, with component blocks for vector forms. The scalar/value and
+gradient arguments received by ``forward`` are unchanged.
+
+Both ``project="reduce"`` and ``project="sparse"`` are supported. Edge
+orientation signs act on integrated local matrices before scatter; reference
+values stay shared across triangles. ``from_assembler`` shares the field
+layout as well as geometry and topology. ``point_data`` does not interpret
+inputs as modal coefficients; use MixedElementAssembler's ``field_data``
+when assembling forms with modal coefficient inputs.
+
+This path supports triangle bilinear matrix assembly only, not hierarchical
+``energy()``, material-state updates, distributed assembly, or facet assembly.
+Quadrature still defaults to degree 2;
+choose it explicitly for higher-order fields.
+
+NodeAssembler and single-field helpers
+--------------------------------------
+
+NodeAssembler accepts the same ``basis="hierarchical"`` and ``field_order``
+keywords in ``from_mesh`` and ``from_elements``. Its scalar/vector load is
+indexed by modal DOFs, with the same numbering as ElementAssembler. Test
+function signs act after quadrature and before scatter; ``point_data`` and
+its gradients keep their nodal interpretation. Both projection backends and
+quadrature batching are supported; the default quadrature degree is still 2.
+Hierarchical calls use the vmap path, including when ``compile()`` is enabled.
+
+An existing hierarchical matrix assembler can supply the field space and
+geometry to a load assembler:
+
+.. code-block:: python
+
+   from tensormesh import Condenser, NodeAssembler
+
+   class Source(NodeAssembler):
+       def forward(self, v, x):
+           return (1 + x[0]) * v
+
+   source = Source.from_assembler(stiffness)
+   layout = stiffness.field_layout()
+   boundary = layout.boundary_mask("u")
+   lifting = layout.dirichlet_values("u", lambda x: x[:, 0] ** 2)
+   condenser = Condenser(boundary, lifting)
+   reduced_matrix, reduced_rhs = condenser(stiffness(), source())
+   coefficients = condenser.recover(reduced_matrix.solve(reduced_rhs))
+   mesh_values = layout.prolong("u", coefficients)
+
+For both single-field assemblers, ``field_layout()`` returns the existing
+BlockLayout helper interface for one field named ``"u"``. It provides the
+interpolation, evaluation, restriction/prolongation and boundary operations
+described below, without constructing a mixed assembler. Layouts read live
+buffers and follow geometry replacement and device/dtype movement. For a
+vector form use ``field_layout(components=2)`` (or its actual component count),
+matching the matrix/load's node-major component ordering. The count is explicit
+because these assemblers infer output components from ``forward``, not from
+a field declaration. Helpers do not assign coordinates to modal DOFs.
+
 Initialization and boundary conditions
 --------------------------------------
 
@@ -169,7 +243,8 @@ Quadrature and device support
 
 Triangle quadrature degree is independent of field degree. On affine
 constant-coefficient problems stiffness needs degree ``2p-2`` and mass
-``2p``; the assembler defaults to ``2*max(field.order)``. Curved geometry,
+``2p``; MixedElementAssembler defaults to ``2*max(field.order)``, whereas
+ElementAssembler retains its degree-2 default. Curved geometry,
 variable coefficients and nonlinear forms need quadrature-convergence
 checks. See :doc:`elements_and_quadrature` for the generated Gaussian rules.
 

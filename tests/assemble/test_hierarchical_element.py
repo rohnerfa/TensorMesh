@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from tensormesh import ElementAssembler, Field, Mesh, MixedElementAssembler
+from tensormesh import ElementAssembler, Field, Mesh, MixedElementAssembler, NodeAssembler
 from tensormesh.assemble import (LaplaceElementAssembler, MassElementAssembler,
                                 LinearElasticityElementAssembler)
 from tensormesh.assemble import _hierarchical_element as tables_module
@@ -293,10 +293,15 @@ def test_unsupported_combinations_fail_explicitly():
         MassElementAssembler.from_mesh(mesh, basis='unknown')
     with pytest.raises(ValueError, match='different field_order'):
         MassElementAssembler.from_mesh(mesh, field_order=3)
-    triangle = Mesh(meshio.Mesh(np.array([[0., 0.], [1., 0.], [0., 1.]]),
-                               [('triangle', np.array([[0, 1, 2]]))]))
-    with pytest.raises(NotImplementedError, match='tetrahedra only'):
-        MassElementAssembler.from_mesh(triangle, basis='hierarchical')
+    quad = Mesh(meshio.Mesh(np.array([[0., 0.], [1., 0.], [1., 1.], [0., 1.]]),
+                           [('quad', np.array([[0, 1, 2, 3]]))]))
+    with pytest.raises(NotImplementedError, match='triangle or tetrahedron'):
+        MassElementAssembler.from_mesh(quad, basis='hierarchical')
+    tetrahedral = make_element(MassElementAssembler, mesh, 3)
+    with pytest.raises(NotImplementedError, match='triangles only'):
+        NodeAssembler.from_assembler(tetrahedral)
+    with pytest.raises(NotImplementedError, match='triangles only'):
+        tetrahedral.field_layout()
     with pytest.raises(NotImplementedError, match='energy'):
         make_element(MassElementAssembler, mesh, 3).energy()
     with pytest.raises(NotImplementedError, match='distributed'):
