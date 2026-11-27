@@ -8,5 +8,6 @@ hardware, and how to profile your own assembly + solve pipelines.
    :maxdepth: 2
 
    benchmarks
+   hierarchical_tetrahedra
    scaling_guide
    profiling

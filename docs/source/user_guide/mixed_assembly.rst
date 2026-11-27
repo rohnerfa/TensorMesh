@@ -419,8 +419,11 @@ loading a checkpoint.
 Signatures requesting physical gradients, coordinates, point/element data or
 ``field_data`` retain per-cell evaluation. Selection is conservative even if an
 argument is unused inside the function. ``reference_mode="cell"`` explicitly
-disables reference sharing and evaluates the integrand per cell.
+selects the previous per-cell evaluation for numerical and performance comparisons.
 Both modes use the same cell chunks, quadrature, source layout and projection.
+
+Checkpoints from the earlier group-ordered or CSR-projection layouts must be
+rebuilt; their table/projection buffers differ from the current reduction layout.
 
 All tetrahedral assembly paths use the requested polynomial exactness degree
 directly. Degrees 5 and 6 use the corrected 15- and 24-point tabulated rules;

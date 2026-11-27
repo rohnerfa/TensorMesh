@@ -49,6 +49,11 @@ Thumbs.db
 # ...except material preset tables shipped as package data
 !tensormesh/material/*.csv
 *.npz
+# Small prepared inputs for the Euler Allen-Cahn benchmark.
+!/cluster/inputs/p4/input.npz
+!/cluster/inputs/p5/input.npz
+!/cluster/inputs/p6/input.npz
+!/cluster/inputs/p8/input.npz
 *.npy
 *.msh
 *.json
