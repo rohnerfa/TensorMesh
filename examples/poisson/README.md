@@ -13,6 +13,7 @@ For batch generation across many source terms (ML workflows), see
 | `poisson_3d.py` | 3D Poisson on a unit cube with tetrahedral mesh |
 | `poisson_h_adaptivity.py` | H-adaptive refinement on an L-shaped domain with gradient singularity |
 | `hierarchical_tetrahedron.py` | Hierarchical 3D Poisson solve with a manufactured solution and nonzero Dirichlet traces |
+| `benchmark_lagrange_orders.py` | Paired CPU setup, matrix and load timings against a separate upstream checkout |
 
 ## Problem Setup
 
@@ -27,6 +28,7 @@ python poisson.py                            # basic 2D example
 python poisson_3d.py                         # 3D example
 python poisson_h_adaptivity.py               # adaptive refinement (requires gmsh >= 4.8)
 python hierarchical_tetrahedron.py --degree 4 # hierarchical fields on linear tetrahedra
+python benchmark_lagrange_orders.py --baseline /path/to/upstream --json timings.json
 ```
 
 ## Output

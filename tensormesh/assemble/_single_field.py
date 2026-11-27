@@ -89,9 +89,13 @@ class _SingleField(nn.Module):
         for kind, conn in mapping.conn.items():
             trans = transformations[kind]
             _, q = trans.quadrature
-            factory = trans.element.get_hierarchical_basis_fns
+            factory = (trans.element.get_basis_fns if basis == "lagrange"
+                       else trans.element.get_hierarchical_basis_fns)
             block = _ReferenceTables(conn, factory(order, q.dtype, q.device), trans)
-            block.register_buffer("frame", frames[kind])
+            if frames is None:
+                block.register_buffer("ref_nodes", mapping.ref_nodes[kind].to(q))
+            else:
+                block.register_buffer("frame", frames[kind])
             blocks[kind] = block
         self.blocks = nn.ModuleDict(blocks)
 
@@ -122,8 +126,8 @@ class _SingleFieldView:
         self._assembler = assembler
         self.fields = [field]
         self._offsets = {"u": 0}
-        self.field_kind = {"u": "hierarchical"}
-        self.canonical_modal = True
+        self.field_kind = {"u": "hierarchical" if field.basis == "hierarchical" else "dofmap"}
+        self.canonical_modal = field.basis == "hierarchical"
         self.field_n_nodes = {"u": assembler._field_space.n_dofs}
         self.n_dofs = self.field_n_nodes["u"] * field.components
         self.n_points = assembler.n_points
@@ -153,7 +157,20 @@ class _SingleFieldView:
         return {f"u__{kind}": block.conn
                 for kind, block in self._assembler._field_space.blocks.items()}
 
+    @property
+    def field_ref_nodes(self):
+        return {f"u__{kind}": block.ref_nodes
+                for kind, block in self._assembler._field_space.blocks.items()}
+
     field_sign = {}
+
+
+def independent_lagrange_map(elements, n_points, field_order):
+    from ..element import element_type2order
+    from .topology import lagrange_dofmap
+    if len({element_type2order[k] for k in elements}) != 1:
+        raise ValueError("independent Lagrange fields require one geometry degree")
+    return lagrange_dofmap({k: v.cpu() for k, v in elements.items()}, n_points, field_order)
 
 
 def volume_batches(trans, field, size, parameters, point_data):
@@ -266,14 +283,15 @@ def integrate_volume(trans, space, kind, size, parameters, point_data, element_d
 class _SingleFieldMixin:
     def _set_field_space(self, field):
         # The default nodal path adds no buffers.
-        self._hierarchical = field
+        self._hierarchical = field if field is not None and field.basis == "hierarchical" else None
+        self._lagrange = field if field is not None and field.basis == "lagrange" else None
 
     @property
     def _field_space(self):
-        return self._hierarchical
+        return self._lagrange if self._lagrange is not None else self._hierarchical
 
     def field_layout(self, components: int = 1):
-        """DOF layout of the hierarchical field named ``u``."""
+        """DOF layout of the independent field named ``u`` (nodal or modal)."""
         if self._field_space is None:
             raise NotImplementedError("field_layout() requires an independent field")
         return self._field_space.layout(self, components)

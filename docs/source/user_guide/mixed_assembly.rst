@@ -324,8 +324,11 @@ unique (oriented) edge, plus cell interiors. In practice this means:
   paired with a P1 pressure; sub- and super-parametric fields are both
   correct.
 
-For generalized **Lagrange** fields, the 3D topological map covers vertex + edge
-DOFs (tetra P2 works; orders needing face DOFs raise ``NotImplementedError``).
+For generalized **Lagrange** fields on tetrahedra, the topological map
+shares face nodes from P3 onward. It numbers them in a canonical corner
+frame and returns each cell's indices in the original nodal basis order;
+curved geometry, mesh-point data and quadrature samples keep their mesh frame.
+Other 3D families needing face DOFs still raise ``NotImplementedError``.
 Hierarchical tetrahedral fields additionally support shared face and private
 cell modes, independently of geometry degree. Generated simplex rules extend
 high-order quadrature; see :doc:`elements_and_quadrature` for legacy-rule details.
@@ -335,6 +338,19 @@ concept) is unavailable; use ``layout.points(name)``,
 ``layout.boundary_mask(name)`` and ``layout.dof_mask(name, where=...)``,
 which work for nodal fields, and move data with
 ``layout.prolong`` / ``layout.restrict`` (isoparametric interpolation).
+
+Single-field volume matrices and loads can use the same Lagrange space:
+
+.. code-block:: python
+
+   stiffness = Laplace.from_mesh(mesh, field_order=3, quadrature_order=6)
+   load = Source.from_assembler(stiffness)  # same geometry, DOF IDs and quadrature
+   K, b = stiffness(), load()
+   boundary = stiffness.field_layout().boundary_mask("u")
+
+Here ``Laplace`` and ``Source`` are an ``ElementAssembler`` and a
+``NodeAssembler`` subclass. Pass ``components`` to ``field_layout`` for
+vector forms. Omitting ``field_order`` keeps ordinary mesh-node assembly.
 
 
 Cell-batched hierarchical tetrahedra

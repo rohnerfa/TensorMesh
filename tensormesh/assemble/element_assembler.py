@@ -8,7 +8,8 @@ import torch.nn as nn
 
 from .projector import ReduceProjector, SparseProjector, Projector
 from .topology import build_edges
-from ._single_field import _SingleField, _SingleFieldMixin, canonical_field_map, integrate_volume
+from ._single_field import (_SingleField, _SingleFieldMixin, canonical_field_map,
+                            independent_lagrange_map, integrate_volume)
 from ..nn import BufferDict
 from ..element import element_type2dimension, element_type2order, Transformation
 from ..sparse import SparseMatrix
@@ -898,7 +899,7 @@ class ElementAssembler(_SingleFieldMixin, nn.Module):
             geometry and point_data remain nodal Lagrange fields.
         field_order : int, optional
             Keyword-only field degree, defaulting to the mesh degree. A different
-            degree requires ``basis='hierarchical'``. Quadrature still
+            Lagrange degree uses a topological DOF map. Quadrature still
             defaults to degree 2; choose it explicitly for higher-order fields.
         *args, **kwargs
             Additional arguments forwarded to ``__post_init__``.
@@ -936,7 +937,10 @@ class ElementAssembler(_SingleFieldMixin, nn.Module):
             geometry, mapping, frames = canonical_field_map(elements, n_points, field_order)
             field_elements = mapping.conn
         elif field_order is not None and orders != {field_order}:
-            raise ValueError("a different field_order requires basis='hierarchical'")
+            if hasattr(cls, "update_state"):
+                raise NotImplementedError("independent-field material state updates are not supported")
+            mapping = independent_lagrange_map(elements, n_points, field_order)
+            field_elements = mapping.conn
         n_dofs = n_points if mapping is None else mapping.n_dofs
 
         projector          = {}

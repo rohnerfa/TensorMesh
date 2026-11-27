@@ -178,7 +178,8 @@ basis while keeping the same ``forward`` contract, pass the keyword-only
 
 ``field_order`` defaults to the mesh's degree; an explicit hierarchical degree
 is independent of geometry degree. Geometry remains nodal, including on curved
-meshes. ``basis="lagrange"`` is the default and uses the mesh degree.
+meshes. ``basis="lagrange"`` is the default; see :doc:`mixed_assembly` for
+independent-order Lagrange fields.
 The names ``basis`` and ``field_order`` are now reserved constructor options,
 rather than parameters forwarded to a subclass's ``__post_init__``.
 

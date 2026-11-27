@@ -17,6 +17,7 @@ import torch
 from typing import Type, Optional, Dict, List, Tuple
 
 from ..assemble import ElementAssembler, NodeAssembler
+from ..element import element_type2order
 from ..sparse import SparseMatrix
 
 from .mesh import DistributedMesh
@@ -34,6 +35,11 @@ def _require_mesh_node_field(dmesh, kwargs):
     """These scatter paths use orig_nid, not a local-to-parent field map."""
     if kwargs.get("basis") == "hierarchical":
         raise NotImplementedError("distributed hierarchical DOF numbering is not supported")
+    order = kwargs.get("field_order")
+    if order is not None:
+        mesh = dmesh.global_mesh
+        if any(element_type2order[k] != order for k in mesh.dim2eletyp[max(mesh.dim2eletyp)]):
+            raise NotImplementedError("distributed independent Lagrange DOF numbering is not supported")
 
 
 # ─── True distributed assembly: each rank assembles ONLY its submesh ──

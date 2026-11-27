@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 
 from .projector import ReduceProjector, SparseProjector
-from ._single_field import _SingleField, _SingleFieldMixin, canonical_field_map, integrate_volume
+from ._single_field import (_SingleField, _SingleFieldMixin, canonical_field_map,
+                            independent_lagrange_map, integrate_volume)
 from .element_assembler import ElementAssembler, RESERVED_NAMES, normalize_quadrature_data
 from ..element import Transformation, element_type2dimension, element_type2order
 from ..nn import BufferDict
@@ -675,7 +676,7 @@ class NodeAssembler(_SingleFieldMixin, nn.Module):
             geometry and point_data remain nodal. Lagrange is the default.
         field_order : int, optional
             Keyword-only field degree, defaulting to the geometry degree. A
-            different degree requires ``basis='hierarchical'``. Select quadrature
+            different Lagrange degree uses a topological DOF map. Select quadrature
             explicitly for high-order fields; its default remains 2.
 
         Returns
@@ -704,7 +705,8 @@ class NodeAssembler(_SingleFieldMixin, nn.Module):
             geometry, mapping, frames = canonical_field_map(elements, n_points, field_order)
             field_elements = mapping.conn
         elif field_order is not None and orders != {field_order}:
-            raise ValueError("a different field_order requires basis='hierarchical'")
+            mapping = independent_lagrange_map(elements, n_points, field_order)
+            field_elements = mapping.conn
         n_dofs = n_points if mapping is None else mapping.n_dofs
 
         for element_type, value in elements.items():

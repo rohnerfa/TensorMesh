@@ -296,8 +296,6 @@ def test_unsupported_combinations_fail_explicitly():
     mesh = patch_mesh()
     with pytest.raises(ValueError, match='basis'):
         MassElementAssembler.from_mesh(mesh, basis='unknown')
-    with pytest.raises(ValueError, match='different field_order'):
-        MassElementAssembler.from_mesh(mesh, field_order=3)
     quad = Mesh(meshio.Mesh(np.array([[0., 0.], [1., 0.], [1., 1.], [0., 1.]]),
                            [('quad', np.array([[0, 1, 2, 3]]))]))
     with pytest.raises(NotImplementedError, match='unsupported simplex'):

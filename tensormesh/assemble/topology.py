@@ -517,6 +517,23 @@ def _classify_reference_nodes(elem_cls, order: int):
     return elem_cls.classify_nodes(order)
 
 
+def _tetra_lagrange_dofmap(elements, n_points, order):
+    from ._hierarchical_topology import hierarchical_dofmap as canonical_dofmap
+    from ._simplex_frame import _geometry_permutations
+
+    corners = _tetrahedron_corners(elements, n_points)
+    canonical, perm = torch.cat(list(corners.values())).sort(dim=1)
+    # The equispaced nodal lattice has the same entity block sizes and
+    # ordering as the canonical numberer. Only the integer IDs are reused.
+    shared = canonical_dofmap({"tetra": canonical}, n_points, order)
+    rows, slots = _geometry_permutations(Tetrahedron, order)
+    dst = slots[rows[tuple(perm.unbind(1))]]  # canonical -> original FIELD slots
+    ids = torch.empty_like(dst).scatter_(1, dst, shared.conn["tetra"])
+    ref = Tetrahedron.get_basis(order, torch.float64)
+    return LagrangeDofMap(dict(zip(corners, ids.split([len(c) for c in corners.values()]))),
+                          shared.n_dofs, shared.vertex_ids, {k: ref for k in corners})
+
+
 def lagrange_dofmap(elements: Mapping[str, torch.Tensor],
                     n_points: int,
                     order: int) -> LagrangeDofMap:
@@ -525,19 +542,19 @@ def lagrange_dofmap(elements: Mapping[str, torch.Tensor],
     Only the corner-vertex columns of ``elements`` are read (corner nodes
     come first in every TensorMesh connectivity), so the mesh may be of
     any order — the field order is fully decoupled from it. DOFs are laid
-    out as ``[vertices | edges | cell interiors]``:
+    out as ``[vertices | edges | tetrahedral faces | cell interiors]``:
 
     * one DOF per mesh vertex used by the cells;
     * ``order - 1`` DOFs per unique edge, **oriented** from the lower to
       the higher global vertex id, with the element-local slot flipped
       whenever the element traverses the edge backwards — this is what
       makes the space :math:`C^0`-conforming for ``order >= 3``;
-    * per-cell interior DOFs (2D cells; 1D cells reuse the edge slots).
+    * shared face-interior nodes on tetrahedra, in ascending corner-ID frame;
+    * private cell-interior nodes (1D cells reuse the edge slots).
 
-    Scope: any order for 1D/2D elements; in 3D only spaces whose nodes sit
-    on vertices and edges (e.g. P2 tetrahedra) — face DOFs need the
-    orientation layer planned with the H(div)/H(curl) work and raise
-    ``NotImplementedError`` here.
+    Tetrahedral meshes support face nodes at P3 and above. Local field
+    slots follow the original reference element; geometry is never reordered.
+    Other 3D families requiring face nodes are not supported.
 
     Parameters
     ----------
@@ -548,6 +565,8 @@ def lagrange_dofmap(elements: Mapping[str, torch.Tensor],
     order : int
         Polynomial order of the Lagrange space, ``>= 1``.
     """
+    if order >= 3 and elements and all(element_type2element(k) is Tetrahedron for k in elements):
+        return _tetra_lagrange_dofmap(elements, n_points, order)
     per_etype = {}
     for element_type, value in elements.items():
         elem_cls = element_type2element(element_type)
@@ -658,7 +677,7 @@ def lagrange_boundary_mask(conn: Mapping[str, torch.Tensor],
     _, inverse, counts = torch.unique(keys, dim=0, return_inverse=True,
                                       return_counts=True)
     is_boundary_facet = counts[inverse] == 1                   # [n_all_facets]
-    mask = torch.zeros(n_dofs, dtype=torch.bool)
+    mask = torch.zeros(n_dofs, dtype=torch.bool, device=keys.device)
     boundary_nodes = torch.cat(facet_nodes, dim=0)[is_boundary_facet].reshape(-1)
     mask[boundary_nodes] = True
     return mask

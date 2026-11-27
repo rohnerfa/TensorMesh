@@ -86,11 +86,10 @@ def test_dofmap_counts_and_shared_edge_consistency():
         assert int((~bnd).sum()) == (k - 1) + 2 * n_interior
 
 
-def test_dofmap_3d_face_dofs_not_implemented():
-    cells = {"tetra": torch.tensor([[0, 1, 2, 3]])}
-    lagrange_dofmap(cells, 4, 2)  # P2 tetra: vertices + edges only — fine
+def test_dofmap_hexahedral_face_dofs_not_implemented():
+    cells = {"hexahedron": torch.arange(8).reshape(1, 8)}
     with pytest.raises(NotImplementedError, match="face"):
-        lagrange_dofmap(cells, 4, 3)  # P3 tetra has face nodes
+        lagrange_dofmap(cells, 8, 2)
 
 
 # --------------------------------------------------------------------- #
