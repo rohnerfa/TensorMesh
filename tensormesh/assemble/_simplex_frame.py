@@ -9,6 +9,14 @@ import torch
 from ..element import element_type2element, element_type2order
 
 
+def _canonical_reference(points, perm):
+    """Express original-frame reference points in sorted-corner coordinates."""
+    bary = torch.cat((1 - points.sum(-1, keepdim=True), points), -1)
+    if perm.ndim == 1:  # one frame, shared [Q,D] rule
+        return bary[:, perm[1:]]
+    return bary.gather(-1, perm[:, None, 1:].expand(-1, points.shape[1], -1))
+
+
 @lru_cache(maxsize=None)
 def _geometry_permutations(element, order):
     """CPU lookup tables, independent of cell IDs and physical coordinates."""

@@ -149,8 +149,87 @@ and call ``from_mesh(...)`` + ``()``. Calling the assembler returns a
    K.shape
    # (143, 143)
 
+Triangle fields can opt into ``basis="hierarchical"`` and an independent
+``field_order`` in ``from_mesh``; geometry and ``point_data`` remain nodal,
+but the matrix is indexed by modal coefficients. See
+:doc:`hierarchical_triangles` for the supported scope and quadrature choice.
+
 That's the whole user story for a scalar bilinear form: one ``forward``
 method, three lines of glue, sparse matrix in hand.
+
+.. _forms-hierarchical-element:
+
+Opt-in hierarchical simplex fields
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Existing nodal calls are unchanged. To select a hierarchical triangle or tetrahedron
+basis while keeping the same ``forward`` contract, pass the keyword-only
+``basis="hierarchical"`` to ``from_mesh``:
+
+.. code-block:: python
+
+   from tensormesh import LinearElasticityElementAssembler
+
+   assembler = LinearElasticityElementAssembler.from_mesh(
+       mesh, basis="hierarchical", field_order=3, quadrature_order=4,
+       E=210e9, nu=0.3,
+   )
+   K = assembler()
+
+``field_order`` defaults to the mesh's degree; an explicit hierarchical degree
+is independent of geometry degree. Geometry remains nodal, including on curved
+meshes. ``basis="lagrange"`` is the default and uses the mesh degree.
+The names ``basis`` and ``field_order`` are now reserved constructor options,
+rather than parameters forwarded to a subclass's ``__post_init__``.
+
+The integrand still receives scalar basis values and gradients ``[D]`` and
+returns a scalar or an entire ``[H,H]`` component block. No rewrite of existing
+mass, Laplace or elasticity ``forward`` methods is needed. ``from_assembler``
+preserves the selected basis, degree, coefficient numbering and shared caches.
+
+.. important::
+
+   The existing quadrature default is still **2**, not an automatic function
+   of field degree. Choose quadrature explicitly: on affine tetrahedra,
+   constant-coefficient stiffness needs degree ``2*p-2`` and mass needs
+   ``2*p``. Curved geometry and variable coefficients require additional care.
+
+The matrix and load use the same modal coefficient indices.
+``n_points`` and ``elements`` still describe the
+**geometry**, not the coefficient space. Matrix size is the scalar coefficient
+count multiplied by the component count inferred from ``forward``.
+``point_data`` (and the automatically supplied coordinate ``x``) continues to
+mean geometry-node data; it is not reinterpreted as modal coefficients.
+``element_data``, ``quadrature_data``, ``scalar_data`` and ``func`` remain
+available. During setup both assemblers reorder each private geometry row
+by increasing corner ID, including the high-order geometry nodes. Ordinary
+integration uses one shared reference table on this canonical cell. With a
+nonsymmetric rule, that can change the physical samples of an inexact integral.
+Calls with ``quadrature_data`` instead integrate at the **original** physical
+samples, preserving the meaning of ``data[cell, q]``. Public reference queries
+to ``layout.evaluate`` also use the original mesh frame.
+
+Interior bubble coefficients can change basis under this reordering. Older
+single-field modal checkpoints are rejected; reinterpolate the physical field
+when transferring it from an older or mixed modal layout. Nodal checkpoints
+are unchanged.
+
+Hierarchical bilinear matrices support **triangles and tetrahedra**.
+Hierarchical ``energy()``, material state updates and distributed assembly
+raise explicit errors. On both shapes, ``MyLoad.from_assembler(assembler)``
+shares the matrix's geometry, field tables, and DOF numbering.
+``assembler.field_layout()`` provides interpolation, evaluation, and boundary
+lifting for the single field named ``"u"``. ``FacetAssembler`` retains its
+nodal API. For a
+discrete nodal load and a modal-to-nodal evaluation map ``T``, the corresponding
+modal load is ``T.T @ f`` (not field interpolation). Similarly, constraints
+must select the appropriate vertex/edge/face coefficient closure, not mesh
+node IDs. See :doc:`hierarchical_tetrahedra` for the connectivity builders and
+:doc:`hierarchical_tetrahedron_fields` for existing mixed-space field helpers.
+
+
+Calling the assembler
+~~~~~~~~~~~~~~~~~~~~~~
 
 The full call signature is
 
@@ -298,6 +377,12 @@ result:
 
    mesh = Mesh.gen_rectangle(chara_length=0.05)
    b = L2Source.from_mesh(mesh)()                     # torch.Tensor [n_points]
+
+Triangle fields may select ``basis="hierarchical"`` and ``field_order`` in
+``from_mesh``. ``NodeAssembler.from_assembler`` also accepts a hierarchical
+ElementAssembler, sharing geometry and modal numbering. Both single-field
+assemblers expose ``field_layout(components=1)`` for interpolation and modal
+boundary data; see :doc:`hierarchical_triangles` for an end-to-end example.
 
 Call signature:
 

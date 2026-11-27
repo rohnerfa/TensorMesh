@@ -1,14 +1,14 @@
 from abc import abstractmethod
 import inspect
-import math
 from typing import Dict, Optional, Callable, Literal
 
 import torch
 import torch.nn as nn
 
 from .projector import ReduceProjector, SparseProjector
-from .element_assembler import RESERVED_NAMES, normalize_quadrature_data
-from ..element import Transformation, element_type2dimension
+from ._single_field import _SingleField, _SingleFieldMixin, canonical_field_map, integrate_volume
+from .element_assembler import ElementAssembler, RESERVED_NAMES, normalize_quadrature_data
+from ..element import Transformation, element_type2dimension, element_type2order
 from ..nn import BufferDict
 from ..mesh import Mesh
 from ..vmap import vmap
@@ -31,7 +31,18 @@ class InputBroadcast:
 
 
 
-class NodeAssembler(nn.Module):
+def _node_projector(conn, n_dofs, project):
+    shape = tuple(conn.shape)
+    if project == "reduce":
+        return ReduceProjector(conn.flatten(), shape, (n_dofs,))
+    if project == "sparse":
+        return SparseProjector(
+            from_=torch.arange(conn.numel(), device=conn.device),
+            to_=conn.flatten(), from_shape=shape, to_shape=(n_dofs,))
+    raise ValueError(f"project should be either 'reduce' or 'sparse', but got {project}")
+
+
+class NodeAssembler(_SingleFieldMixin, nn.Module):
     r"""Assemble an element-wise linear form into a global node vector.
 
     :class:`NodeAssembler` is the linear-form counterpart of
@@ -88,7 +99,8 @@ class NodeAssembler(nn.Module):
         Maps each ``element_type`` to its connectivity tensor of shape
         :math:`[|\mathcal C|, B]`.
     n_points : int
-        Number of mesh points (length of the output vector for scalar problems).
+        For independent fields, the geometry mesh point count; the output
+        vector is indexed by field DOFs instead of geometry nodes.
     dimension : int
         Spatial dimension of the mesh, one of ``1``, ``2``, ``3``.
     element_types : list[str]
@@ -109,6 +121,7 @@ class NodeAssembler(nn.Module):
         '__post_init__',
         'from_assembler',
         'from_mesh',
+        'field_layout',
         'compile',
         'reset_compile',
     ]
@@ -116,7 +129,7 @@ class NodeAssembler(nn.Module):
                    projector:nn.ModuleDict, 
                    transformation:nn.ModuleDict,
                    elements:BufferDict,
-                   *args, **kwargs):
+                   *args, _field=None, **kwargs):
         super().__init__()
 
         element_types = list(projector.keys())
@@ -129,6 +142,9 @@ class NodeAssembler(nn.Module):
         self.dimension          = dimension
         self.element_types      = element_types
         self.n_points           = next(iter(elements.values())).shape[0]
+        self._set_field_space(_field)
+        if _field is not None:
+            self.n_points = next(iter(transformation.values())).n_points
         
         # Compile options
         self._compile: bool = False
@@ -138,6 +154,8 @@ class NodeAssembler(nn.Module):
         self.__post_init__(*args, **kwargs)
         
     def _integrate(self, batch_integral, jxw, n_element, n_basis, use_element_parallel):
+        if batch_integral.is_complex():
+            jxw = jxw.to(batch_integral.dtype)
         if not use_element_parallel:
             error_msg = f"the shape returned by forward function is {batch_integral.shape} which is not supported, should either be [batch_size,{n_basis}] or [batch_size,{n_basis}, dof_per_point]"
             assert batch_integral.dim() == 2 or batch_integral.dim() == 3, error_msg
@@ -280,8 +298,10 @@ class NodeAssembler(nn.Module):
         torch.Tensor
             1D tensor of shape :math:`[|\mathcal V|]` (scalar problems) or
             flattened ``[|\mathcal V| \times H]`` (vector problems with
-            ``H`` degrees of freedom per node).
+            ``H`` degrees of freedom per node). For independent fields,
+            replace the mesh point count with the scalar field DOF count.
         """
+        space = self._field_space
         if point_data is None:
             point_data = {}
         if scalar_data is None:
@@ -302,12 +322,16 @@ class NodeAssembler(nn.Module):
         point_data["x"] = points # type:ignore
 
         self = self.type(points.dtype).to(points.device) # type:ignore
+        if space is not None:
+            scalar_data = {key: torch.as_tensor(value, device=points.device)
+                           for key, value in scalar_data.items()}
 
         for key, value in point_data.items():
             assert value.shape[0] == points.shape[0], f"the shape of {key} should be [n_point, ...], but got {value.shape}"
  
         # Use fast path if enabled (bypasses vmap, uses direct broadcast)
-        if self._compile and len(self.element_types) == 1 and func is None and not quadrature_data:
+        if (self._compile and space is None and len(self.element_types) == 1
+                and func is None and not quadrature_data):
             element_type = self.element_types[0]
             point_data_keys = sorted([k for k in point_data.keys() if k != "x"])
             scalar_data_keys = sorted(scalar_data.keys())
@@ -338,7 +362,7 @@ class NodeAssembler(nn.Module):
             (lambda x: x=="v"     , InputBroadcast(False, True,  True)), # [:        , n_quadrature, n_v_basis]
             (lambda x: x=="gradv" , InputBroadcast(True,  True,  True)), # [n_element, n_quadrature, n_v_basis, n_dim]
             (lambda x: x in scalar_data.keys(),
-                                    InputBroadcast(True, True,  True)),
+                                    InputBroadcast(space is None, space is None, space is None)),
             (lambda x: x in quadrature_data,
                                     InputBroadcast(True, True,  False)),  # [n_element, n_quadrature,        :]
             (lambda x: x in point_data.keys(),
@@ -382,48 +406,10 @@ class NodeAssembler(nn.Module):
         for element_type in self.element_types:
             trans:Transformation = self.transformation[element_type] # type:ignore
             proj:ReduceProjector       = self.projector[element_type]      # type:ignore
-            element_integral:Optional[torch.Tensor] = None           # [n_element, n_basis, ...]
-            if batch_size in (-1, None):
-                n_batch      = 1
-                n_batch_size = trans.n_quadrature
-            else:
-                n_batch_size = batch_size
-                n_batch      = math.ceil(trans.n_quadrature / batch_size)
-            ele_point_data = {k:v[self.elements[element_type]] for k,v in point_data.items()}
-
-            for i in range(n_batch):
-                shape_val       = trans.batch_shape_val(i*n_batch_size, n_batch_size)
-                shape_grad, jxw = trans.batch_shape_grad_jxw(
-                                    quadrature_start = i*n_batch_size, 
-                                    quadrature_batch = n_batch_size) 
-
-                args = []
-                for key in signature.parameters:
-                    if key in ["v"]:
-                        args.append(shape_val) 
-                    elif key in ["gradv"]:
-                        args.append(shape_grad)
-                    elif key in ele_point_data:
-                        args.append(torch.einsum("eb...,qb->eq...",ele_point_data[key], shape_val))
-                        # point data : [element_batch, quadrature_batch, ...]
-                    elif key.startswith("grad") and key[4:] in ele_point_data: # grad point data
-                        args.append(torch.einsum("eb...,eqbd->eq...d",ele_point_data[key[4:]], shape_grad)) 
-                        # grad point data : [element_batch, quadrature_batch, ..., dim]
-                    elif key in quadrature_data:
-                        args.append(quadrature_data[key][element_type][:, i*n_batch_size:(i+1)*n_batch_size])
-                        # quadrature data : [element_batch, quadrature_batch, ...]
-                    elif key in scalar_data: # type:ignore
-                        args.append(scalar_data[key])
-                    else:
-                        raise NotImplementedError(f"key {key} is not implemented")
-
-                batch_integral = parallel_fn(*args) # [n_element, batch_size, n_basis, ...] or [batch_size,  n_basis, ...]
-
-                batch_integral = self._integrate(batch_integral, jxw, trans.n_elements, trans.n_basis, use_element_parallel)
-
-                element_integral = batch_integral if element_integral is None else element_integral + batch_integral
-
-            assert element_integral is not None
+            n_batch_size = trans.n_quadrature if batch_size in (-1, None) else batch_size
+            element_integral = integrate_volume(
+                trans, space, element_type, n_batch_size, signature.parameters, point_data, {},
+                quadrature_data, scalar_data, parallel_fn, self._integrate, use_element_parallel, arity=1)
             integral = proj(element_integral) if integral is None else integral + proj(element_integral)
     
         assert integral is not None
@@ -448,6 +434,9 @@ class NodeAssembler(nn.Module):
         By default (``mode="disable"``), only the vmap bypass is enabled without 
         ``torch.compile``. This provides the best performance for most cases.
         Set ``mode="default"`` or other modes to additionally enable ``torch.compile``.
+
+        Independent fields retain the regular vmap path; the optimized
+        broadcast path uses mesh-node DOFs.
 
         Examples
         --------
@@ -610,13 +599,14 @@ class NodeAssembler(nn.Module):
     def from_assembler(cls, obj, *args,**kwargs):
         r"""Build a :class:`NodeAssembler` that shares topology with ``obj``.
 
-        Much faster than :meth:`from_mesh` since the projector and cached
-        :class:`Transformation` are reused as-is.
+        Node assemblers share their projector and transformations. An independent-field
+        ElementAssembler shares geometry and field tables, with a new
+        vector projector using the same DOF numbering and projection backend.
 
         Parameters
         ----------
-        obj : NodeAssembler
-            An existing node assembler whose mesh topology should be reused.
+        obj : NodeAssembler or ElementAssembler
+            An existing node assembler or an independent-field element assembler.
         *args, **kwargs
             Additional arguments forwarded to ``__post_init__``.
 
@@ -625,10 +615,21 @@ class NodeAssembler(nn.Module):
         NodeAssembler
             A new assembler sharing the same mesh.
         """
-        err_msg = f"the object {obj} should inheritate from NodeAssembler"
-        assert isinstance(obj, NodeAssembler), err_msg
+        space = getattr(obj, "_field_space", None)
+        if isinstance(obj, ElementAssembler) and space is not None:
+            projector = nn.ModuleDict({
+                kind: _node_projector(block.conn, space.n_dofs,
+                                      "sparse" if isinstance(obj.projector[kind], SparseProjector)
+                                      else "reduce")
+                for kind, block in space.blocks.items()
+            })
+        else:
+            assert isinstance(obj, NodeAssembler), "obj must be a node or independent-field element assembler"
+            projector = obj.projector
+        if space is not None:
+            kwargs["_field"] = space
         return cls(
-                obj.projector, 
+                projector,
                 obj.transformation,
                 obj.elements,
                 *args, **kwargs
@@ -642,7 +643,8 @@ class NodeAssembler(nn.Module):
                       device:torch.device|str="cpu",
                       dtype:torch.dtype=torch.float32,
                       project:str = "reduce",
-                      *args,**kwargs):
+                      *args, basis:str = "lagrange", field_order:Optional[int] = None,
+                      **kwargs):
         r"""Build a :class:`NodeAssembler` from raw connectivity tensors.
 
         Slower than :meth:`from_assembler` because the projection backend
@@ -668,6 +670,13 @@ class NodeAssembler(nn.Module):
             :meth:`torch.Tensor.index_add_` and is memory-efficient,
             ``"sparse"`` uses a sparse mat-vec product and is faster but
             uses more memory.
+        basis : {'lagrange', 'hierarchical'}
+            Keyword-only field basis family. Hierarchical fields support triangles and tetrahedra;
+            geometry and point_data remain nodal. Lagrange is the default.
+        field_order : int, optional
+            Keyword-only field degree, defaulting to the geometry degree. A
+            different degree requires ``basis='hierarchical'``. Select quadrature
+            explicitly for high-order fields; its default remains 2.
 
         Returns
         -------
@@ -678,31 +687,31 @@ class NodeAssembler(nn.Module):
         tranformation      = {}
         
         n_points = points.shape[0]
+        if basis not in ("lagrange", "hierarchical"):
+            raise ValueError("basis must be 'lagrange' or 'hierarchical'")
+        if field_order is not None and (isinstance(field_order, bool)
+                or not isinstance(field_order, int) or field_order < 1):
+            raise ValueError("field_order must be an integer >= 1")
+        mapping = None
+        geometry, frames = elements, None
+        field_elements = elements
+        orders = {element_type2order[kind] for kind in elements}
+        if basis == "hierarchical":
+            if field_order is None:
+                if len(orders) != 1:
+                    raise ValueError("field_order is required for mixed geometry degrees")
+                field_order = next(iter(orders))
+            geometry, mapping, frames = canonical_field_map(elements, n_points, field_order)
+            field_elements = mapping.conn
+        elif field_order is not None and orders != {field_order}:
+            raise ValueError("a different field_order requires basis='hierarchical'")
+        n_dofs = n_points if mapping is None else mapping.n_dofs
 
         for element_type, value in elements.items():
-            n_element, n_basis = value.shape
-            # quadrature_weights[element_type], quadrature_points[element_type] =\
-            # get_quadrature(element_type, quadrature_order) # [n_quadrature], [n_quadrature, n_dim]
-            # shape_val[element_type] = get_shape_val(element_type, quadrature_points[element_type]) # [n_quadrature, n_basis]
-
-            if project == "reduce":
-                projector[element_type] = ReduceProjector(
-                    indices   = value.flatten(),
-                    from_shape = (n_element, n_basis),
-                    to_shape   = (n_points,)
-                )
-            elif project == "sparse":
-                projector[element_type] = SparseProjector(
-                    from_ = torch.arange(n_element * n_basis, device=value.device).reshape(n_element, n_basis).flatten(),
-                    to_   = value.flatten(),
-                    from_shape = (n_element, n_basis),
-                    to_shape   = (n_points,)
-                )
-            else:
-                raise ValueError(f"project should be either 'reduce' or 'sparse', but got {project}")
+            projector[element_type] = _node_projector(field_elements[element_type], n_dofs, project)
             tranformation[element_type] = Transformation(
                 points, 
-                value,
+                geometry[element_type],
                 element_type,
                 quadrature_order
             )
@@ -710,6 +719,8 @@ class NodeAssembler(nn.Module):
         projector          = nn.ModuleDict(projector)
         transformation     = nn.ModuleDict(tranformation)
         elements           = BufferDict(elements) # type:ignore
+        if mapping is not None:
+            kwargs["_field"] = _SingleField(mapping, transformation, field_order, basis, frames)
 
         assembler = cls(
                    projector, 
@@ -724,7 +735,8 @@ class NodeAssembler(nn.Module):
     def from_mesh(cls, mesh:Mesh,
                   quadrature_order:int = 2,
                   project:str = "reduce",
-                  *args, **kwargs):
+                  *args, basis:str = "lagrange", field_order:Optional[int] = None,
+                  **kwargs):
         r"""Build a :class:`NodeAssembler` from a :class:`~tensormesh.Mesh`.
 
         Slower than :meth:`from_assembler` because the projection backend
@@ -740,6 +752,12 @@ class NodeAssembler(nn.Module):
             defaults to ``2``.
         project : {'reduce', 'sparse'}, optional
             Projection backend; defaults to ``"reduce"``.
+        basis : {'lagrange', 'hierarchical'}
+            Keyword-only field basis family. Lagrange remains the default;
+            hierarchical simplex fields use canonical modal DOF numbering.
+        field_order : int, optional
+            Keyword-only field degree, defaulting to the mesh degree.
+            Geometry, point_data and quadrature defaults are unchanged.
         *args, **kwargs
             Additional arguments forwarded to ``__post_init__``.
 
@@ -754,6 +772,8 @@ class NodeAssembler(nn.Module):
         if isinstance(elements, torch.Tensor):
             elements = {mesh.default_element_type: elements}
 
+        if basis != "lagrange" or field_order is not None:
+            kwargs.update(basis=basis, field_order=field_order)
         return cls.from_elements(points, 
                                  elements, 
                                  quadrature_order, 

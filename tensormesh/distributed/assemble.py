@@ -30,6 +30,12 @@ except ImportError:
 import torch.distributed as dist
 
 
+def _require_mesh_node_field(dmesh, kwargs):
+    """These scatter paths use orig_nid, not a local-to-parent field map."""
+    if kwargs.get("basis") == "hierarchical":
+        raise NotImplementedError("distributed hierarchical DOF numbering is not supported")
+
+
 # ─── True distributed assembly: each rank assembles ONLY its submesh ──
 
 def _compute_partition_ids(dmesh: "DistributedMesh") -> torch.Tensor:
@@ -186,6 +192,7 @@ def distributed_element_assemble_per_rank(
     if call_kwargs is None:
         call_kwargs = {}
 
+    _require_mesh_node_field(dmesh, assembler_kwargs)
     world = dist.get_world_size()
     assert dmesh.num_partitions == world, (
         f"DistributedMesh has {dmesh.num_partitions} partitions but "
@@ -360,6 +367,7 @@ def _element_assemble_all(
 
     Returns merged global COO (values, row, col) on CPU.
     """
+    _require_mesh_node_field(dmesh, assembler_kwargs)
     n = dmesh.num_partitions
     assemblers = []  # (asm, orig_nid_cpu, submesh) or None
 
@@ -457,6 +465,7 @@ def _node_assemble_all(
 
     Returns global vector on CPU.
     """
+    _require_mesh_node_field(dmesh, assembler_kwargs)
     n = dmesh.num_partitions
     assemblers = []      # (asm, orig_nid, submesh, local_call_kwargs) or None
 

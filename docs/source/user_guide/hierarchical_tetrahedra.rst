@@ -3,9 +3,16 @@ Hierarchical tetrahedral bases
 
 TensorMesh provides a vertex-oriented, non-nodal hierarchical basis of
 :math:`P_p` on tetrahedra for every integer :math:`p\geq1`. The evaluator
-and topological coefficient map are independent of geometry order. This
-chapter describes their mathematical and API contract; volume assembly
-and modal interpolation are separate integration layers.
+and topological coefficient map are independent of geometry order. Select
+``Field(..., basis="hierarchical")`` in :class:`~tensormesh.MixedElementAssembler`
+to assemble these spaces. This chapter describes their mathematical and API
+contract; see :doc:`mixed_assembly` for grouped integration and chunking.
+For interpolation, evaluation and nonzero boundary lifting, see
+:doc:`hierarchical_tetrahedron_fields`.
+Single-field matrices and loads can opt into this basis through
+``ElementAssembler`` and ``NodeAssembler`` with ``basis="hierarchical"``.
+They use one canonical reference table for all cells. See
+:ref:`forms-hierarchical-element` for quadrature, field layouts and checkpoint compatibility.
 
 Reference element and local layout
 ----------------------------------
@@ -111,8 +118,8 @@ TensorMesh's Jacobi recurrence; the design reference is
 `NGSolve's H1 high-order elements
 <https://github.com/NGSolve/ngsolve/blob/1cb0200fa087ea0af1645e1de3feb309fa998e0c/fem/h1hofe_impl.hpp>`_.
 
-Reference evaluator orientation
--------------------------------
+Canonical orientation classes
+-----------------------------
 
 For the cell's four original global corner IDs, ``orientation`` is the
 tuple of **local slots** that sorts those IDs in ascending order. For
@@ -126,11 +133,10 @@ in local order. Reference points and geometry connectivity keep their
 original meaning. Classes depend only on relative corner IDs, independently
 of degree, coordinates, Jacobian sign or outward normals.
 
-An explicit orientation is useful for evaluating in a noncanonical reference
-frame. The DOF map below instead requires canonical geometry rows and uses
-the default (identity) orientation. With direct coefficient gathers, both
-shared-face values and tangential derivatives agree. H1 conformity does
-not require continuity of the normal derivative.
+Shared-face values and tangential derivatives then agree when coefficients
+are gathered directly with ``conn``. **Do not apply triangle-style signs
+afterward**: edge and face orientation is already in the evaluator. H1
+conformity does not require continuity of the normal derivative.
 
 Changing global vertex numbering can change face modes by more than a
 permutation. Compare physical fields or operators through a verified change
@@ -153,24 +159,31 @@ Evaluating functions and gradients
 The evaluator also supports arbitrary leading batch axes and empty batches.
 It is a PyTorch module: ``.to()``, ``.float()``, ``.double()`` and CUDA
 movement set its tabulation dtype/device. Input points are converted to
-that dtype/device. Each factory call returns an independent module.
+that dtype/device. Each factory call returns an independent module; an
+assembler can cache shared reference tables per occupied orientation class.
 Analytic first gradients remain differentiable with respect to input points;
 ``grad().grad()`` is not implemented.
 
 Topology and coefficient numbering
 -----------------------------------
 
+For the canonical single-field layout use ``hierarchical_dofmap`` on
+sorted-corner cells and ``hierarchical_boundary_mask(mapping)`` as for
+:doc:`hierarchical_triangles`. The mixed assembler uses the following map
+for cells in their original frame:
+
 .. code-block:: python
 
    from tensormesh.assemble.topology import (
-       hierarchical_dofmap, hierarchical_boundary_mask,
+       hierarchical_tetrahedron_dofmap,
+       hierarchical_tetrahedron_boundary_mask,
    )
 
-   elements = {"tetra": torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])}
-   mapping = hierarchical_dofmap(elements, n_points=5, order=4)
+   elements = {"tetra": torch.tensor([[0, 1, 2, 3], [4, 3, 1, 2]])}
+   mapping = hierarchical_tetrahedron_dofmap(elements, n_points=5, order=4)
    assert mapping.n_dofs == 55  # 5 vertices + 9*3 edges + 7*3 faces + 2 cells
-   boundary = hierarchical_boundary_mask(mapping)
-   higher = hierarchical_dofmap(
+   boundary = hierarchical_tetrahedron_boundary_mask(mapping.conn, 4, mapping.n_dofs)
+   higher = hierarchical_tetrahedron_dofmap(
        elements, n_points=5, order=6, topology=mapping.topology)
    assert higher.topology is mapping.topology
 
@@ -193,30 +206,37 @@ and :math:`T` cells, the global scalar dimension is
 
 with face and cell terms zero below their first supported degrees. Private
 cell blocks follow original cell order within each element type, then
-mapping insertion order. Changing from an unsorted cell frame preserves
-the interior block's IDs but may change the polynomials its coefficients represent.
+mapping insertion order. Scheduling orientation groups cannot affect this
+coefficient layout.
 
-All entity discovery happens on CPU. Inputs may reside on
+All entity discovery and grouping happens on CPU. Inputs may reside on
 another device; outputs are CPU long tensors. Only the first four geometry
 connectivity columns are read: noncorner high-order nodes do not become
-field coefficients. Corner IDs must be strictly increasing within each cell
-and lie in ``[0, n_points)``. When preparing high-order cells, permute the
-full geometry row with the corners. Use one shape family per mesh.
+field coefficients. Corner IDs must be distinct within each cell and lie
+in ``[0, n_points)``. Other shapes and invalid field orders are rejected.
 Empty cell blocks are supported. A mixed-geometry-order restriction imposed
 by an assembler is separate from this topological builder.
 
-The private ``topology`` object holds all entities and incidence counts even
-for p=1. Treat it as immutable. Reuse checks the mesh point count, element
-type order and canonical corner connectivity; coordinates and noncorner
+The private ``topology`` object holds all entities even for p=1, along with
+face incidence, representative incident cells and stable per-type orientation
+groups. Treat it as immutable. Reuse checks the mesh point count, element
+type order and original corner connectivity; coordinates and noncorner
 geometry nodes may change without rebuilding it.
 
 The boundary mask uses incidence of faces identified by the first four
 vertex carriers. Exactly-one-cell faces are boundary faces; their full
 vertex/edge/face closure is selected, and cell-interior coefficients are
-excluded. The mask is returned on CPU. Coefficients
+excluded. The mask is returned on the connectivity device. Coefficients
 are modal amplitudes, not values attached to fictitious points: nonzero
 Dirichlet data needs a trace interpolation/lifting procedure. Filling every
 coefficient with one does not represent a constant field.
+
+``MixedElementAssembler`` selects the correct class table for every occupied
+orientation and uses unsigned coefficients. The same topology and reference
+tables are reused across fields of matching degree. Matrix and load assembly
+use reduction projection of original-cell-order local contributions, through the
+same ``ReduceProjector`` used for Lagrange mixed assembly. Cell chunks span
+orientations; neither connectivity nor cell data is reordered by orientation.
 
 Numerical coverage
 ------------------
@@ -226,6 +246,6 @@ extended p=8 and p=10 checks; independent SciPy Jacobi formulas; autograd
 at interior and boundary points; entity support and exact mode nesting;
 all 24 orientation classes; and physical shared-face values/tangential
 derivatives at p=4 and p=6. Topology tests cover noncontiguous original IDs,
-high-order geometry corners, original cell order, reusable topology, global
+high-order geometry corners, original cell order, reusable groups, global
 dimensions and boundary closure. CUDA value/gradient and topology-device
 tests are guarded when CUDA is unavailable.

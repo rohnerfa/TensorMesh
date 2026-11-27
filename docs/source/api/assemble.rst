@@ -15,7 +15,7 @@ Element Assembler
 Mixed Element Assembler
 -----------------------
 
-Multi-field (block) bilinear and linear forms on Lagrange spaces —
+Multi-field (block) bilinear and linear forms on Lagrange or hierarchical spaces —
 e.g. Taylor-Hood Stokes — declared field-by-field and assembled into
 one block sparse matrix. See the :doc:`user guide chapter
 </user_guide/mixed_assembly>` for a tutorial.
@@ -32,21 +32,46 @@ one block sparse matrix. See the :doc:`user guide chapter
     :members:
 
 
-Hierarchical Simplex Connectivity
----------------------------------
+Canonical Simplex Connectivity
+-----------------------------------
 
-These topological maps are independent of assembler and geometry order.
-Both :doc:`/user_guide/hierarchical_triangles` and
-:doc:`/user_guide/hierarchical_tetrahedra` use the same map on canonical cells.
+The shape-independent numberer accepts canonical triangles and tetrahedra.
+The boundary mask takes the resulting DOF map and marks the exterior closure.
 
-Other cell shapes raise ``NotImplementedError``.
-
-.. autoclass:: tensormesh.assemble.topology.HierarchicalDofMap(conn, n_dofs, vertex_ids, topology, order)
+.. autoclass:: tensormesh.assemble.topology.HierarchicalDofMap
     :no-members:
 
 .. autofunction:: tensormesh.assemble.topology.hierarchical_dofmap
 
 .. autofunction:: tensormesh.assemble.topology.hierarchical_boundary_mask
+
+
+Signed Triangle Connectivity
+----------------------------
+
+The mixed assembler uses these helpers for triangles in the original cell frame.
+
+.. autoclass:: tensormesh.assemble.topology.HierarchicalTriangleDofMap
+    :no-members:
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_triangle_dofmap
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_triangle_boundary_mask
+
+
+Hierarchical Tetrahedron Connectivity
+-------------------------------------
+
+Tetrahedral maps use canonically oriented edge and face evaluators, with
+direct coefficient gathering and reusable degree-independent topology.
+See :doc:`/user_guide/hierarchical_tetrahedra` for the full convention.
+
+.. autoclass:: tensormesh.assemble.topology.HierarchicalTetrahedronDofMap
+    :no-members:
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_tetrahedron_dofmap
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_tetrahedron_boundary_mask
 
 
 Facet Assembler
