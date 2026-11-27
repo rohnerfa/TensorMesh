@@ -15,7 +15,7 @@ mesh order (generalized Taylor–Hood pairs, quadratic fields on linear
 gmsh imports); :func:`lagrange_boundary_mask` marks its boundary DOFs
 by facet incidence, without any geometric predicate.
 
-:func:`hierarchical_dofmap` shares the vertex/edge entity numbering for
+:func:`hierarchical_dofmap` numbers vertices and edges for
 triangle modal spaces, keeping edge modes in degree order and returning
 parity-dependent orientation signs instead of reversing nodal indices.
 Tetrahedral modal spaces use :func:`hierarchical_tetrahedron_dofmap` and
@@ -160,7 +160,7 @@ class HierarchicalDofMap(NamedTuple):
 
 
 def _number_vertices_and_edges(per_etype, n_points, order):
-    """Shared entity numbering; values are (element class, corner IDs)."""
+    """Number modal vertices and edges; values are (element class, corner IDs)."""
     vertex_ids = torch.unique(torch.cat([c.reshape(-1) for _, c in per_etype.values()]))
     g2l = torch.full((n_points,), -1, dtype=torch.long)
     g2l[vertex_ids] = torch.arange(vertex_ids.shape[0], dtype=torch.long)
@@ -194,7 +194,7 @@ def hierarchical_dofmap(elements: Mapping[str, torch.Tensor],
     Edge direction is canonical from smaller to larger mesh vertex ID.
     Reversed edges get (-1)**n, never a reversal of mode indices.
 
-    Entity numbering is shared with lagrange_dofmap, but no nodal basis
+    Entity numbering follows the lagrange_dofmap convention, but no nodal basis
     construction or reference-node classification is needed. Setup is
     vectorized over cells; only element types are iterated in Python.
     Connectivity may reside on any device; outputs are on CPU, as used by
@@ -559,10 +559,29 @@ def lagrange_dofmap(elements: Mapping[str, torch.Tensor],
         corners = value[:, :elem_cls.n_vertex].long()        # [E, n_vertex] mesh ids
         per_etype[element_type] = (elem_cls, slots, n_interior, corners)
 
-    vertex_ids, g2l, edge_ids, n_global_edges = _number_vertices_and_edges(
-        {key: (elem_cls, corners) for key, (elem_cls, _, _, corners) in per_etype.items()},
-        n_points, order)
+    # vertex DOFs: compact renumbering of the used corner vertices
+    vertex_ids = torch.unique(torch.cat([c.reshape(-1) for *_ , c in per_etype.values()]))
+    g2l = torch.full((n_points,), -1, dtype=torch.long)
+    g2l[vertex_ids] = torch.arange(vertex_ids.shape[0], dtype=torch.long)
     n_vertex_dofs = vertex_ids.shape[0]
+
+    # unique (undirected) edges across all element types
+    edge_ids = {}
+    n_global_edges = 0
+    if order >= 2:
+        chunks, sizes = [], []
+        for element_type, (elem_cls, _, _, corners) in per_etype.items():
+            pairs = corners[:, elem_cls.edge]                # [E, n_le, 2] mesh ids
+            chunks.append(torch.sort(pairs, dim=-1).values.reshape(-1, 2))
+            sizes.append((element_type, pairs.shape[0], pairs.shape[1]))
+        cat = torch.cat(chunks, dim=0)
+        unique_edges, inverse = torch.unique(cat, dim=0, return_inverse=True)
+        n_global_edges = unique_edges.shape[0]
+        offset = 0
+        for element_type, n_element, n_le in sizes:
+            edge_ids[element_type] = inverse[offset:offset + n_element * n_le] \
+                .reshape(n_element, n_le)
+            offset += n_element * n_le
 
     edge_base = n_vertex_dofs
     interior_base = n_vertex_dofs + n_global_edges * (order - 1)
