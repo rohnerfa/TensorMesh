@@ -1,11 +1,13 @@
 import sys 
 import numpy as np
+import pytest
 import torch
 import meshio
 from typing import Type
 sys.path.append("../..")
 
 from tensormesh import ElementAssembler, NodeAssembler,  Mesh
+from tensormesh.element.basis import tet_linspace
 from tensormesh.element.quadrature import lin_quadrature,\
                                         tri_quadrature,\
                                         tet_quadrature
@@ -42,6 +44,15 @@ def test_quad():
 
 def test_tet():
     _basis(Tetrahedron)
+
+@pytest.mark.parametrize("include_boundary", [True, False])
+def test_p5_tet_linspace(include_boundary):
+    nodes = tet_linspace(Tetrahedron.points.double(), 5, include_boundary)
+    lo = 0 if include_boundary else 1
+    # The fourth barycentric numerator, 5 - i - j - k, must also be >= lo.
+    lattice = [(i, j, k) for k in range(lo, 6) for j in range(lo, 6) for i in range(lo, 6)
+               if 5 - i - j - k >= lo]
+    torch.testing.assert_close(5 * nodes, nodes.new_tensor(lattice), rtol=0, atol=1e-14)
 
 def test_hex():
     _basis(Hexahedron)

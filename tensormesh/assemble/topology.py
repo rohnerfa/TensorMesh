@@ -22,9 +22,10 @@ import scipy.sparse
 import torch
 
 from ..element import element_type2element, element_type2order
+from ._hierarchical_topology import HierarchicalDofMap, hierarchical_boundary_mask, hierarchical_dofmap
 
 __all__ = ["build_edges", "lagrange_dofmap", "lagrange_boundary_mask", "boundary_facet_mask",
-           "LagrangeDofMap"]
+           "LagrangeDofMap", "HierarchicalDofMap", "hierarchical_dofmap", "hierarchical_boundary_mask"]
 
 
 def build_edges(

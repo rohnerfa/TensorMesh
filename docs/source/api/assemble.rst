@@ -32,6 +32,23 @@ one block sparse matrix. See the :doc:`user guide chapter
     :members:
 
 
+Hierarchical Simplex Connectivity
+---------------------------------
+
+These topological maps are independent of assembler and geometry order.
+Both :doc:`/user_guide/hierarchical_triangles` and
+:doc:`/user_guide/hierarchical_tetrahedra` use the same map on canonical cells.
+
+Other cell shapes raise ``NotImplementedError``.
+
+.. autoclass:: tensormesh.assemble.topology.HierarchicalDofMap(conn, n_dofs, vertex_ids, topology, order)
+    :no-members:
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_dofmap
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_boundary_mask
+
+
 Facet Assembler
 ---------------
 
