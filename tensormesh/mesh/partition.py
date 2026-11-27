@@ -334,7 +334,12 @@ def partition_mesh(mesh, n_parts: int, method: str = 'coordinate', ghost_nodes: 
     if not ghost_nodes:
         raise NotImplementedError("ghost_nodes=False is not yet supported. Element-based partitioning always implies ghost nodes.")
 
-    # 1. Partition Elements
+    labels = _partition_labels(mesh, n_parts, method)
+    return [_extract_partition(mesh, labels, rank)[0] for rank in range(n_parts)]
+
+
+def _partition_labels(mesh, n_parts, method='coordinate'):
+    """Label top-dimensional cells, in mesh block and row order."""
     if method == 'coordinate':
         # Fast path: RCB on element centroids — no adjacency graph needed
         centroids, target_types, cell_counts = _compute_element_centroids(mesh)
@@ -348,61 +353,18 @@ def partition_mesh(mesh, n_parts: int, method: str = 'coordinate', ghost_nodes: 
             target_types = [target_types]
         cell_counts = [mesh.cells[k].shape[0] for k in target_types]
 
-    # 2. Iterate and split
-    submeshes = []
+    return dict(zip(target_types, element_labels.split(cell_counts)))
 
-    labels_per_type = {}
-    curr = 0
-    for k, count in zip(target_types, cell_counts):
-        labels_per_type[k] = element_labels[curr:curr+count]
-        curr += count
-        
-    for p in range(n_parts):
-        sub_cells_dict = {}
-        sub_nodes_indices = []
-        
-        # Filter elements for this partition
-        for k in target_types:
-            labels = labels_per_type[k]
-            mask = (labels == p)
-            if not mask.any():
-                continue
-                
-            cells = mesh.cells[k][mask] # [n_sub, n_nodes_per_elem]
-            sub_cells_dict[k] = cells
-            sub_nodes_indices.append(cells.reshape(-1))
-            
-        if not sub_cells_dict:
-            # Empty partition
-            submeshes.append(None)
-            continue
-            
-        # Unique nodes required by this partition
-        used_nodes = torch.cat(sub_nodes_indices).unique()
-        used_nodes = torch.sort(used_nodes).values
-        
-        # Extract points
-        sub_points = mesh.points[used_nodes]
-        
-        # Remap cells
-        sub_cells_meshio = []
-        for k, cells in sub_cells_dict.items():
-            new_cells = torch.searchsorted(used_nodes, cells)
-            sub_cells_meshio.append((k, new_cells.cpu().numpy()))
-            
-        # Create meshio mesh
-        m_io = meshio.Mesh(
-            points=sub_points.cpu().numpy(),
-            cells=sub_cells_meshio
-        )
-        
-        # Create TensorMesh
-        submesh = mesh.__class__(m_io)
-        submesh.to(mesh.device)
-        
-        # Add metadata
-        submesh.point_data['orig_nid'] = used_nodes
-        
-        submeshes.append(submesh)
-        
-    return submeshes
+
+def _extract_partition(mesh, labels, rank):
+    """Materialize only this rank's legacy submesh, and retain its parent row indices."""
+    rows = {k: torch.where(ids == rank)[0] for k, ids in labels.items()}
+    cells = {k: mesh.cells[k][r] for k, r in rows.items() if r.numel()}
+    if not cells:
+        return None, rows
+    used = torch.cat([c.flatten() for c in cells.values()]).unique(sorted=True)
+    local = [(k, torch.searchsorted(used, c).cpu().numpy()) for k, c in cells.items()]
+    submesh = mesh.__class__(meshio.Mesh(points=mesh.points[used].cpu().numpy(), cells=local))
+    submesh.to(mesh.device)
+    submesh.point_data['orig_nid'] = used
+    return submesh, rows
