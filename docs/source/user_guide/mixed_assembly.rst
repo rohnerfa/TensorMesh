@@ -54,6 +54,10 @@ declarations, one per unknown. Each field names its **trial** and
 **test** function (the argument names your ``forward`` will use), its
 polynomial ``order``, and its number of vector ``components``:
 
+Triangle fields may also select ``basis="hierarchical"`` instead of the
+default nodal Lagrange basis. See :doc:`hierarchical_triangles` for signed
+connectivity, modal initialization, evaluation and boundary conditions.
+
 .. code-block:: python
 
    fields = [
@@ -291,8 +295,9 @@ mesh-order basis, ``grad{key}`` available), ``element_data``,
       w = layout.split(sol)["u"]                    # [n_u, c] on the P2 DOFs
       K = assembler(field_data={"w": ("u", w)})
 
-   On a mesh whose order equals the field order the two channels agree —
-   ``point_data`` is then the simpler spelling.
+   For a Lagrange field whose order equals the mesh order, the two channels
+   agree. Hierarchical field data always contains modal coefficients, including
+   at the geometry order; use ``field_data`` for those coefficients.
 
 
 .. _mixed-generalized-pairs:
@@ -319,16 +324,112 @@ unique (oriented) edge, plus cell interiors. In practice this means:
   paired with a P1 pressure; sub- and super-parametric fields are both
   correct.
 
-Current limits, checked with explicit errors: in 3D the topological map
-covers vertex + edge DOFs (tetra P2 works; orders needing face DOFs
-raise ``NotImplementedError``), and the quadrature tables stop at
-degree 7 — about P3-P2 in practice.
+For generalized **Lagrange** fields, the 3D topological map covers vertex + edge
+DOFs (tetra P2 works; orders needing face DOFs raise ``NotImplementedError``).
+Hierarchical tetrahedral fields additionally support shared face and private
+cell modes, independently of geometry degree. Generated simplex rules extend
+high-order quadrature; see :doc:`elements_and_quadrature` for legacy-rule details.
 
-For fields with topological DOFs, ``layout.node_ids`` (a mesh-node
+For Lagrange fields with topological DOFs, ``layout.node_ids`` (a mesh-node
 concept) is unavailable; use ``layout.points(name)``,
 ``layout.boundary_mask(name)`` and ``layout.dof_mask(name, where=...)``,
-which work for every field kind, and move data with
+which work for nodal fields, and move data with
 ``layout.prolong`` / ``layout.restrict`` (isoparametric interpolation).
+
+
+Cell-batched hierarchical tetrahedra
+----------------------------------------
+
+Select ``Field(..., basis="hierarchical")`` on a tetrahedral mesh to use
+canonical vertex-ID-oriented edge and face functions. All fields share one
+topological partition into at most 24 orientation classes. Shared reference
+banks contain values ``[O,Q,B]`` and gradients ``[O,Q,3,B]``, where ``O`` is the
+number of occupied orientations; geometry stays nodal. Cell chunks span
+orientations in original mesh order and select the corresponding reference
+tables on the device. Equal-degree hierarchical fields share both the banks
+and active-chunk gathers. Lagrange fields reuse orientation-independent tables.
+By default, eligible value-only forms evaluate their reference integrands once
+per occupied orientation in the active chunk.
+
+The same weak-form interface applies. ``batch_size`` counts quadrature points;
+the optional ``element_batch_size`` independently limits cells across orientations:
+
+.. code-block:: python
+
+   class Poisson3D(MixedElementAssembler):
+       fields = [Field("u", "v", order=4, basis="hierarchical")]
+
+       def forward(self, gradu, gradv):
+           return (gradu * gradv).sum()
+
+       def forward_vector(self, v, x):
+           return (1 + x[0]) * v
+
+   mesh = Mesh.gen_cube(chara_length=0.5, order=1).double()
+   assembler = Poisson3D.from_mesh(mesh)
+   K = assembler(batch_size=16, element_batch_size=128)
+   b = assembler.assemble_vector(batch_size=16, element_batch_size=128)
+   boundary = assembler.layout.boundary_mask("u")
+
+With ``element_batch_size=None``, all cells of each element type are integrated
+together, including all occupied orientations. A positive limit slices the
+original cell order, rather than restarting at each orientation. This parameter
+is available on the hierarchical tetrahedral path. ``element_data`` and field
+connectivity retain original mesh order.
+
+Completed local blocks occupy disjoint slices of an original-cell-order source buffer.
+One precomputed destination-index map per test/trial block combines them into
+sparse global values through ``ReduceProjector`` and ``index_add_``, as in the
+Lagrange mixed assembler. Loads use the analogous coefficient reduction.
+Orientation is already encoded in the reference tables and connectivity;
+projection sums contributions sharing a global entry. Source buffers and
+destination indices still scale with all local basis pairs; chunking bounds integration
+scratch memory, not total assembly memory. Persistent reference storage scales
+with occupied orientations, while temporary reference gathers and weak-form
+intermediates are bounded by the active cell/quadrature chunk.
+GPU speedups depend on degree, chunk sizes, hardware, and form, and must be measured.
+
+Sharing reference integrands
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``reference_mode="auto"`` (the default on both matrix and load calls) shares
+integrands whose signatures contain only field values and global ``scalar_data``
+parameters. This includes scalar/vector mass matrices, rectangular value-only
+couplings and constant-coefficient loads. It uses the supplied ``forward`` or
+``func``; it does not recognize forms by name or replace them with a hardcoded
+mass formula.
+
+For each active cell/quadrature chunk, weak-form evaluation produces
+``[O,Q,test,trial,...]`` rather than ``[E,Q,test,trial,...]``. Geometry weights
+remain ``[E,Q]``. Orientations with similar cell counts are contracted together
+using batched matrix multiplication, and results are restored to original cell
+order. Power-of-two population buckets bound the padded weight/local-block
+layout to fewer than twice the active cells, even for skewed distributions.
+A balanced population needs one batched contraction across all orientations.
+No cell-sized quadrature/basis-pair product is created by this path.
+
+This works with curved geometry: the geometry weights may vary at every
+quadrature point. Integrands are recomputed on every assembly call, so changed
+global parameters and their autograd graphs are respected. Only integer packing
+schedules are cached. The all-cell schedule is constructed during setup;
+additional cell limits have one-time schedule setup during the first call.
+These derived integer buffers move with the module and are rebuilt after
+loading a checkpoint.
+
+Signatures requesting physical gradients, coordinates, point/element data or
+``field_data`` retain per-cell evaluation. Selection is conservative even if an
+argument is unused inside the function. ``reference_mode="cell"`` explicitly
+disables reference sharing and evaluates the integrand per cell.
+Both modes use the same cell chunks, quadrature, source layout and projection.
+
+All tetrahedral assembly paths use the requested polynomial exactness degree
+directly. Degrees 5 and 6 use the corrected 15- and 24-point tabulated rules;
+degree 7 uses a generated 64-point rule. See :doc:`elements_and_quadrature` for
+the rule-selection compatibility notes.
+
+See :doc:`hierarchical_tetrahedra` for the basis, numbering, and orientation
+contract. Modal coefficients have no interpolation-point coordinates;
+``layout.points`` and coordinate-predicate ``dof_mask`` are nodal-only APIs.
 
 
 Worked examples

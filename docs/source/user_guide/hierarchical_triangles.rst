@@ -70,6 +70,187 @@ edge mode by endpoint incidence, never cell-interior bubbles. Modal
 coefficients do not have interpolation-point coordinates and must not be
 initialized or constrained by assigning nodal point values directly.
 
-This reference-basis/topology layer does not change assembler defaults;
-explicit mixed-assembler selection and modal field helpers are separate
-integration functionality.
+Mixed assembly
+--------------
+
+Select the family explicitly; Lagrange remains the default. Hierarchical
+fields always use signed topological numbering, even when their degree
+equals geometry order. Different fields may mix families, orders and
+component counts. Geometry and ``point_data`` retain their nodal Lagrange
+interpretation.
+
+.. code-block:: python
+
+   from tensormesh import Condenser, Field, Mesh, MixedElementAssembler
+
+   class Poisson(MixedElementAssembler):
+       fields = [Field("u", "v", order=4, basis="hierarchical")]
+
+       def forward(self, gradu, gradv):
+           return (gradu * gradv).sum()
+
+       def forward_vector(self, v, x):
+           return (1 + x[0]) * v
+
+   mesh = Mesh.gen_rectangle(chara_length=0.3, order=1, element_type="tri").double()
+   assembler = Poisson.from_mesh(mesh)
+   layout = assembler.layout
+   condenser = Condenser(layout.boundary_mask("u"))
+   reduced_matrix, reduced_load = condenser(assembler(), assembler.assemble_vector())
+   coefficients = condenser.recover(reduced_matrix.solve(reduced_load))
+   mesh_values = layout.prolong("u", coefficients)
+
+Reference tables are shared across elements and tabulated once per
+family/order/element type in each assembler construction. Orientation
+signs act on integrated local contributions before global projection, on
+both test and trial sides. The batched integration and ``ReduceProjector``
+are unchanged. For hierarchical ``field_data``, supply global modal
+coefficients: gathered coefficients receive signs before interpolation.
+
+ElementAssembler
+----------------
+
+For a single-field bilinear form, the existing ElementAssembler subclasses
+can also select hierarchical triangle fields:
+
+.. code-block:: python
+
+   from tensormesh.assemble import LaplaceElementAssembler
+
+   stiffness = LaplaceElementAssembler.from_mesh(
+       mesh, basis="hierarchical", field_order=4, quadrature_order=8)
+   matrix = stiffness()
+
+``basis="lagrange"`` remains the default. ``field_order`` defaults to the
+geometry mesh degree; specify it to use a higher-order field on low-order
+geometry. Geometry connectivity, ``n_points``, ``point_data`` and its
+gradients remain nodal. Matrix dimensions instead use the number of modal
+coefficients, with component blocks for vector forms. The scalar/value and
+gradient arguments received by ``forward`` are unchanged.
+
+Both ``project="reduce"`` and ``project="sparse"`` are supported. Edge
+orientation signs act on integrated local matrices before scatter; reference
+values stay shared across triangles. ``from_assembler`` shares the field
+layout as well as geometry and topology. ``point_data`` does not interpret
+inputs as modal coefficients; use MixedElementAssembler's ``field_data``
+when assembling forms with modal coefficient inputs.
+
+This path supports triangle bilinear matrix assembly only, not hierarchical
+``energy()``, material-state updates, distributed assembly, or facet assembly.
+Quadrature still defaults to degree 2;
+choose it explicitly for higher-order fields.
+
+NodeAssembler and single-field helpers
+--------------------------------------
+
+NodeAssembler accepts the same ``basis="hierarchical"`` and ``field_order``
+keywords in ``from_mesh`` and ``from_elements``. Its scalar/vector load is
+indexed by modal DOFs, with the same numbering as ElementAssembler. Test
+function signs act after quadrature and before scatter; ``point_data`` and
+its gradients keep their nodal interpretation. Both projection backends and
+quadrature batching are supported; the default quadrature degree is still 2.
+Hierarchical calls use the vmap path, including when ``compile()`` is enabled.
+
+An existing hierarchical matrix assembler can supply the field space and
+geometry to a load assembler:
+
+.. code-block:: python
+
+   from tensormesh import Condenser, NodeAssembler
+
+   class Source(NodeAssembler):
+       def forward(self, v, x):
+           return (1 + x[0]) * v
+
+   source = Source.from_assembler(stiffness)
+   layout = stiffness.field_layout()
+   boundary = layout.boundary_mask("u")
+   lifting = layout.dirichlet_values("u", lambda x: x[:, 0] ** 2)
+   condenser = Condenser(boundary, lifting)
+   reduced_matrix, reduced_rhs = condenser(stiffness(), source())
+   coefficients = condenser.recover(reduced_matrix.solve(reduced_rhs))
+   mesh_values = layout.prolong("u", coefficients)
+
+For both single-field assemblers, ``field_layout()`` returns the existing
+BlockLayout helper interface for one field named ``"u"``. It provides the
+interpolation, evaluation, restriction/prolongation and boundary operations
+described below, without constructing a mixed assembler. Layouts read live
+buffers and follow geometry replacement and device/dtype movement. For a
+vector form use ``field_layout(components=2)`` (or its actual component count),
+matching the matrix/load's node-major component ordering. The count is explicit
+because these assemblers infer output components from ``forward``, not from
+a field declaration. Helpers do not assign coordinates to modal DOFs.
+
+Initialization and boundary conditions
+--------------------------------------
+
+``layout.interpolate("u", fn)`` interpolates a physical function into
+coefficients using a reference modal collocation solve, not a monomial
+Vandermonde or an L2 projection. ``fn`` takes flat coordinates ``[N,D]``
+and returns ``[N]`` or ``[N,c]``; constants may broadcast. Shared
+coefficients are oriented and averaged. On curved geometry the expansion
+is polynomial in reference coordinates.
+
+For nonzero Dirichlet data, expand traces instead of assigning boundary
+point values to modal coefficients:
+
+.. code-block:: python
+
+   boundary = layout.boundary_mask("u")
+   lifting = layout.dirichlet_values("u", lambda x: x[:, 0] ** 2)
+   condenser = Condenser(boundary, lifting)
+
+The lifting is a full block vector. Only boundary values are sampled,
+using Chebyshev-Lobatto points along each boundary edge; bubbles,
+unconstrained coefficients and other fields are zero. Polynomial traces
+through field degree are exact up to roundoff; other traces are
+interpolated. For vector fields, ``component=k`` selects one scalar
+component. These helpers currently address the whole topological boundary,
+not tagged subsets.
+
+``layout.restrict`` interpolates the mesh's nodal FE data into modal
+coefficients; it cannot recover information absent from low-order input.
+``layout.prolong`` evaluates coefficients at geometry nodes for plotting:
+it is not an identity even when geometry and field orders coincide.
+Low-order mesh vertices alone cannot display interior bubbles.
+
+Modal ``points``, ``node_ids``, ``dof_index`` and coordinate-predicate
+``dof_mask`` are deliberately unsupported. Use explicit coefficient masks
+or topological boundary masks. A scalar passed to ``layout.cat`` fills
+coefficients, not a constant physical field.
+
+Arbitrary-point evaluation
+--------------------------
+
+.. code-block:: python
+
+   samples = layout.evaluate("u", coefficients, reference)
+   gradients = layout.evaluate("u", coefficients, reference, gradient=True)
+   # Physical points within explicitly supplied cells:
+   samples = layout.evaluate("u", coefficients, physical_points,
+                             cell_indices=[0, 2], physical=True)
+
+Points can be shared ``[Q,D]`` or per-cell ``[E_selected,Q,D]``. Evaluation
+returns ``[E_selected,Q,...]``, with a final physical derivative axis for
+``gradient=True``. Physical triangle evaluation uses batched Newton
+inversion, seeded by the corner-affine map, including curved geometry.
+Outside points and nonconvergence raise errors; geometry must be valid and
+invertible. This is not a global point locator. Supply ``element_type``
+for mixed-element meshes. Coefficients must be on the mesh's device.
+
+Quadrature and device support
+------------------------------
+
+Triangle quadrature degree is independent of field degree. On affine
+constant-coefficient problems stiffness needs degree ``2p-2`` and mass
+``2p``; MixedElementAssembler defaults to ``2*max(field.order)``, whereas
+ElementAssembler retains its degree-2 default. Curved geometry,
+variable coefficients and nonlinear forms need quadrature-convergence
+checks. See :doc:`elements_and_quadrature` for the generated Gaussian rules.
+
+The supported device workflow is to construct on CPU and transfer the
+complete assembler and coefficient vectors to CUDA. CUDA-specific public
+assembly/evaluation tests are guarded when no CUDA device is available.
+Reference values/gradients and orientation buffers follow module device
+and dtype conversions. Physical inversion and high-order float64 work
+require backend support; MPS does not support float64.

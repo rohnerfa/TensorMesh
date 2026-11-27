@@ -3,9 +3,15 @@ Hierarchical tetrahedral bases
 
 TensorMesh provides a vertex-oriented, non-nodal hierarchical basis of
 :math:`P_p` on tetrahedra for every integer :math:`p\geq1`. The evaluator
-and topological coefficient map are independent of geometry order. This
-chapter describes their mathematical and API contract; grouped assembly
-and modal interpolation are separate integration layers.
+and topological coefficient map are independent of geometry order. Select
+``Field(..., basis="hierarchical")`` in :class:`~tensormesh.MixedElementAssembler`
+to assemble these spaces. This chapter describes their mathematical and API
+contract; see :doc:`mixed_assembly` for grouped integration and chunking.
+For interpolation, evaluation and nonzero boundary lifting, see
+:doc:`hierarchical_tetrahedron_fields`.
+Single-field bilinear forms can also opt into this basis through
+``ElementAssembler.from_mesh(..., basis="hierarchical", field_order=p)``;
+see :ref:`forms-hierarchical-element` for quadrature and compatibility limits.
 
 Reference element and local layout
 ----------------------------------
@@ -218,6 +224,13 @@ excluded. The mask is returned on the connectivity device. Coefficients
 are modal amplitudes, not values attached to fictitious points: nonzero
 Dirichlet data needs a trace interpolation/lifting procedure. Filling every
 coefficient with one does not represent a constant field.
+
+``MixedElementAssembler`` selects the correct class table for every occupied
+orientation and uses unsigned coefficients. The same topology and reference
+tables are reused across fields of matching degree. Matrix and load assembly
+use reduction projection of original-cell-order local contributions, through the
+same ``ReduceProjector`` used for Lagrange mixed assembly. Cell chunks span
+orientations; neither connectivity nor cell data is reordered by orientation.
 
 Numerical coverage
 ------------------
