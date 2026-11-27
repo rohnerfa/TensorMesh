@@ -32,6 +32,35 @@ one block sparse matrix. See the :doc:`user guide chapter
     :members:
 
 
+Hierarchical Triangle Connectivity
+-----------------------------------
+
+These topological maps are independent of assembler and geometry order.
+See :doc:`/user_guide/hierarchical_triangles` for ordering and orientation.
+
+.. autoclass:: tensormesh.assemble.topology.HierarchicalDofMap
+    :no-members:
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_dofmap
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_boundary_mask
+
+
+Hierarchical Tetrahedron Connectivity
+-------------------------------------
+
+Tetrahedral maps use canonically oriented edge and face evaluators, with
+direct coefficient gathering and reusable degree-independent topology.
+See :doc:`/user_guide/hierarchical_tetrahedra` for the full convention.
+
+.. autoclass:: tensormesh.assemble.topology.HierarchicalTetrahedronDofMap
+    :no-members:
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_tetrahedron_dofmap
+
+.. autofunction:: tensormesh.assemble.topology.hierarchical_tetrahedron_boundary_mask
+
+
 Facet Assembler
 ---------------
 
